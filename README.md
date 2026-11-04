@@ -94,6 +94,7 @@ Run these in Terminal, inside the `~/tv-mirror` folder (`cd ~/tv-mirror`):
 | `python3 tvmirror.py --height 720` | Lower quality, smoother on weak Wi-Fi |
 | `python3 tvmirror.py --mode live` | Tell the TV it's a live broadcast instead of a long video file |
 | `python3 tvmirror.py --encoder hardware` | Use the Mac's video chip: less CPU, but more delay on still screens |
+| `python3 tvmirror.py --audio-codec aac` | Sound format: `mp2` (default), `ac3` or `aac` |
 | `python3 tvmirror.py --mode stream` | For newer TVs that don't like the default Sony mode |
 | `python3 tvmirror.py --debug` | Show what the TV is asking for (for troubleshooting) |
 | `python3 tvmirror.py --test-pattern` | Send a moving test picture instead of your screen |
@@ -108,7 +109,7 @@ enough. An empty extra screen is the worst case.
 
 **What TV Mirror does about it:** it keeps the video and the sound at a
 constant size, topping every frame up with filler data the TV throws away
-(H.264 filler units and AC-3 audio). The TV's buffer then fills in a fraction
+(H.264 filler units, and MP2 sound, the format European TV broadcasts use). The TV's buffer then fills in a fraction
 of a second, however still your screen is.
 
 **Fine-tuning for your TV:**
@@ -144,6 +145,11 @@ the TV gets the picture with silence. To send sound too:
 
 ## Troubleshooting
 
+- **The TV says "Playback not available"**: TV Mirror asks the TV whether it's
+  playing and, if not, automatically tries other formats, ending with one older
+  Sony TVs are known to play. If it still fails, try `--mode live`, or
+  `--audio-codec aac`, or `--encoder hardware`.
+
 - **"No TV found"**: the TV and Mac must be on the same network. Guest Wi-Fi
   and some mesh routers block devices from seeing each other. On the TV, check
   Settings > Network > Home Network setup > Renderer is turned on.
@@ -157,7 +163,7 @@ the TV gets the picture with silence. To send sound too:
 ## How it works
 
 1. **ffmpeg** captures the screen (AVFoundation) and encodes constant-bitrate
-   H.264 (x264 with filler data) plus AC-3 audio into an MPEG-TS stream.
+   H.264 (x264 with filler data) plus MP2 audio into an MPEG-TS stream.
 2. A small web server built into the script serves the stream on port 8090.
    For older Sony TVs it pretends the stream is a very long video file, since
    they refuse endless streams.

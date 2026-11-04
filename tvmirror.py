@@ -43,7 +43,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 APP_NAME = "TV Mirror"
-VERSION = "1.5"
+VERSION = "1.6"
 REPO = "nizarhalim05/tv-mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -53,6 +53,21 @@ CLOCK_FONTS = [
     "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/System/Library/Fonts/Helvetica.ttc",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
+# Sound formats. MP2 (what European TV broadcasts use) and AC-3 always use the
+# same number of bytes, even for silence. AAC shrinks silence to ~5 kbit/s, which
+# makes TVs that wait for a fixed amount of data wait much longer.
+AUDIO_CODECS = {
+    "mp2": ["-c:a", "mp2", "-b:a", "384k"],
+    "ac3": ["-c:a", "ac3", "-b:a", "448k"],
+    "aac": ["-c:a", "aac", "-b:a", "128k"],
+}
+# Combinations tried in order if the TV says it can't play the stream.
+# The last one is the one older Sony TVs are known to play (but with more delay).
+PROFILES = [
+    ("software", "mp2", "constant-size video + MP2 sound"),
+    ("software", "aac", "constant-size video + AAC sound"),
+    ("hardware", "aac", "Mac's video chip + AAC sound (plays on more TVs, more delay)"),
 ]
 RATE_STEPS = [2, 3, 4, 6, 8, 10, 12, 15, 20, 25, 30]   # Mbit/s choices for + and -
 HAS_DRAWTEXT = False   # set at startup: can this ffmpeg draw text on the video?
@@ -211,6 +226,42 @@ def tv_play(tv, url):
     soap(tv["control_url"], "Play", [("InstanceID", 0), ("Speed", 1)])
 
 
+def tv_state(tv):
+    """Ask the TV what it's doing: (state, status), e.g. ('PLAYING', 'OK')."""
+    try:
+        xml = soap(tv["control_url"], "GetTransportInfo", [("InstanceID", 0)]).decode(errors="ignore")
+    except Exception:
+        return None, None
+    state = re.search(r"<CurrentTransportState>(.*?)</CurrentTransportState>", xml)
+    status = re.search(r"<CurrentTransportStatus>(.*?)</CurrentTransportStatus>", xml)
+    return (state.group(1).strip().upper() if state else None,
+            status.group(1).strip().upper() if status else None)
+
+
+def tv_check(tv, wait=15, debug=False):
+    """After pressing play: 'playing', 'failed' (the TV gave up) or 'unknown'."""
+    seen_playing, stopped_count = False, 0
+    end = time.time() + wait
+    time.sleep(2)
+    while time.time() < end:
+        state, status = tv_state(tv)
+        if debug:
+            print(f"  [debug] TV state: {state} / {status}")
+        if state is None:
+            return "unknown"          # this TV doesn't answer the question
+        if status == "ERROR_OCCURRED":
+            return "failed"
+        if state == "PLAYING":
+            seen_playing = True
+            stopped_count = 0
+        elif state in ("STOPPED", "NO_MEDIA_PRESENT"):
+            stopped_count += 1
+            if stopped_count >= 3:    # stopped by itself for ~3 s: it gave up
+                return "failed"
+        time.sleep(1)
+    return "playing" if seen_playing else "unknown"
+
+
 def tv_stop(tv):
     try:
         soap(tv["control_url"], "Stop", [("InstanceID", 0)])
@@ -291,10 +342,11 @@ def ffmpeg_command(args):
     cmd += [
         "-g", str(args.fps),              # a keyframe every second -> fast start
         "-bsf:v", "dump_extra",           # repeat picture settings so a TV can join any time
-        # AC-3 sound always uses the same number of bytes, even for silence
-        # (AAC shrinks silence to ~5 kbit/s, which also makes TVs wait).
-        "-c:a", "ac3", "-b:a", "448k", "-ar", "48000", "-ac", "2",
-        "-f", "mpegts", "-mpegts_flags", "+pat_pmt_at_frames",
+    ] + AUDIO_CODECS[args.audio_codec] + [
+        "-ar", "48000", "-ac", "2",
+        "-f", "mpegts",
+        # system_b = label AC-3 sound the European (DVB) way
+        "-mpegts_flags", "+pat_pmt_at_frames" + ("+system_b" if args.audio_codec == "ac3" else ""),
     ]
     if args.boost:
         # Optional extra: also pad the whole stream with empty packets up to this rate.
@@ -941,9 +993,11 @@ def main():
     p.add_argument("--audio-device", help='audio input to send, e.g. "BlackHole 2ch" (default: silent)')
     p.add_argument("--fps", type=int, default=30, help="frames per second (default 30)")
     p.add_argument("--height", type=int, default=1080, help="video height, e.g. 720 or 1080 (default 1080)")
-    p.add_argument("--encoder", choices=["software", "hardware"], default="software",
+    p.add_argument("--audio-codec", choices=["mp2", "ac3", "aac"], default=None,
+                   help="sound format (default mp2; tries others if the TV refuses)")
+    p.add_argument("--encoder", choices=["software", "hardware"], default=None,
                    help="software (default: constant size, least delay) or hardware "
-                        "(less CPU, but still screens lag more)")
+                        "(less CPU, but still screens lag more). Tries others if the TV refuses")
     p.add_argument("--port", type=int, default=8090, help="port for the stream (default 8090)")
     p.add_argument("--mode", choices=["sony", "live", "stream"], default="sony",
                    help="how the video is served: sony (default, looks like a long video file), "
@@ -975,7 +1029,7 @@ def main():
     filters = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
                              capture_output=True, text=True).stdout
     HAS_DRAWTEXT = re.search(r"\sdrawtext\s", filters) is not None
-    if args.encoder == "software":
+    if args.encoder != "hardware":
         encoders = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
                                   capture_output=True, text=True).stdout
         if "libx264" not in encoders:
@@ -1023,6 +1077,15 @@ def main():
 
     capture = {"proc": None}
 
+    # Formats to try, starting with what was asked for
+    wanted = (args.encoder or "software", args.audio_codec or "mp2")
+    profiles = [p for p in PROFILES if (p[0], p[1]) == wanted] or \
+               [(wanted[0], wanted[1], f"{wanted[0]} video + {wanted[1].upper()} sound")]
+    profiles += [p for p in PROFILES if p not in profiles]
+    if args.encoder == "hardware":     # asked for: don't switch to software later
+        profiles = [p for p in profiles if p[0] == "hardware"] or profiles
+    args.encoder, args.audio_codec = profiles[0][0], profiles[0][1]
+
     def start_capture():
         # Let a TV fall at most ~0.75 s behind before skipping ahead
         rate = max(args.rate, args.boost or 0) + 0.5
@@ -1066,7 +1129,9 @@ def main():
             what = f"screen {int(args.screen.split()[-1]) + 1}"
         if vd_screen and args.screen == vd_screen:
             what += " (TV Mirror Display)"
-        log(f"  Now showing: {what}  |  stream: {args.rate:g} Mbit/s constant  |  mode: {StreamHandler.mode}")
+        kind = "constant" if args.encoder == "software" else "varying"
+        log(f"  Now showing: {what}  |  stream: {args.rate:g} Mbit/s {kind}, "
+            f"{args.audio_codec.upper()} sound  |  mode: {StreamHandler.mode}")
 
     if not start_capture():
         print("\nScreen capture failed to start. If you see a permission error above:\n"
@@ -1079,10 +1144,25 @@ def main():
     print(f"\nStreaming at {url}")
     if tv:
         print(f"Sending to: {tv['name']} ({tv['host']})")
-        try:
-            play_on_tv()
-        except Exception as e:
-            print(f"\n{e}\nThe TV didn't accept the stream. Try:  --mode live   or   --height 720")
+        for i, (encoder, audio_codec, label) in enumerate(profiles):
+            if i > 0:
+                print(f"The TV couldn't play that. Trying: {label}...")
+                args.encoder, args.audio_codec = encoder, audio_codec
+                stop_capture()
+                BROADCASTER.disconnect_all()
+                if not start_capture():
+                    continue
+            try:
+                play_on_tv()
+            except Exception as e:
+                print(f"  The TV refused: {e}")
+                continue
+            print(f"Checking the TV can play it ({label})...")
+            result = tv_check(tv, debug=args.debug)
+            if result != "failed":
+                break
+        else:
+            print("\nThe TV couldn't play any of the formats. Try:  --mode live   or   --height 720")
             stop_capture()
             server.shutdown()
             sys.exit(1)
