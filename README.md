@@ -31,6 +31,28 @@ KDL-32WD754 (2016).
 4. Your screen appears on the TV after a few seconds.
 5. To stop, press **Q** (or close the window).
 
+## Keep working while the TV shows something else
+
+macOS only draws the desktop you're looking at, so it can't mirror "Desktop 1"
+while you're on Desktop 2. Instead, TV Mirror can add an **invisible extra
+screen** that macOS always draws, and send that to the TV:
+
+```
+python3 ~/tv-mirror/tvmirror.py --virtual-display
+```
+
+1. The first time, it builds a small helper (a few seconds). If it asks for
+   Apple's developer tools, run `xcode-select --install` and try again.
+2. A new screen called **TV Mirror Display** appears and goes to the TV.
+3. To put a window on the TV, hover over the window's green button and
+   choose **Move to TV Mirror Display** (or drag it off the right edge of
+   your screen).
+4. Keep working on your normal desktops; the TV keeps showing that screen.
+5. When you quit TV Mirror, the screen disappears and its windows come back.
+
+Make sure **System Settings > Desktop & Dock > Displays have separate Spaces**
+is on, so swiping between your desktops doesn't affect the TV.
+
 ## Controls while it's running
 
 Click the TV Mirror (Terminal) window, then press:
@@ -55,6 +77,7 @@ Run these in Terminal, inside the `~/tv-mirror` folder (`cd ~/tv-mirror`):
 |---|---|
 | `python3 tvmirror.py --screen 2` | Mirror screen 2 without asking |
 | `python3 tvmirror.py --boost 32M` | Less lag (needs good Wi-Fi). Default is `25M`; `0` turns it off |
+| `python3 tvmirror.py --virtual-display` | Add an invisible extra screen for the TV (see above) |
 | `python3 tvmirror.py --show-clock` | Show a clock on the TV so you can measure the delay |
 | `python3 tvmirror.py --auto-reset 5` | Reset the delay automatically every 5 minutes |
 | `python3 tvmirror.py --tv "Bravia"` | Pick a TV by name or IP address if you have several |
@@ -104,9 +127,9 @@ the TV gets the picture with silence. To send sound too:
   Restarting the TV often helps.
 - **The TV keeps connecting and disconnecting**: try `--encoder software`,
   then `--mode stream`.
-- **Mirrors the wrong screen**: use `--screen 1` or `--screen 2`. macOS
-  "Spaces" (extra desktops you swipe between) aren't separate screens; TV
-  Mirror shows whichever Space is on the screen you picked.
+- **Mirrors the wrong screen**: use `--screen 1` or `--screen 2`, or press
+  1/2/3 while it's running. To show one thing while working on other
+  desktops, use `--virtual-display`.
 
 ## How it works
 
@@ -118,7 +141,11 @@ the TV gets the picture with silence. To send sound too:
 3. The TV is found with an **SSDP** search, then told to play the stream with
    **UPnP AVTransport** commands (`SetAVTransportURI` and `Play`).
 
-Everything uses Python's standard library plus ffmpeg; nothing else to install.
+The invisible screen comes from `vdisplay.m`, a small Objective-C program
+that uses macOS's built-in (undocumented) `CGVirtualDisplay` feature. TV
+Mirror compiles it on your Mac the first time you use `--virtual-display`.
+
+Everything else uses Python's standard library plus ffmpeg.
 
 ## Requirements
 

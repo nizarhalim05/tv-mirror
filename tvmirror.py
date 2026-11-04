@@ -19,6 +19,8 @@ Press Ctrl+C to stop.
 """
 
 import argparse
+import atexit
+import hashlib
 import http.server
 import os
 import queue
@@ -498,6 +500,186 @@ class StreamServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 # --------------------------------------------------------------------------- #
+# Virtual screen (an extra invisible monitor macOS always draws)
+# --------------------------------------------------------------------------- #
+
+# Source of the small helper program; it's compiled on your Mac the first time.
+# The same code is in vdisplay.m in the repository, with comments.
+VDISPLAY_SOURCE = r'''// vdisplay - creates an invisible extra screen ("virtual display") on macOS.
+//
+// macOS only draws the desktop you're looking at, so a desktop you've swiped away
+// from can't be recorded. A virtual display is a screen macOS *always* draws,
+// even though no real monitor is attached. TV Mirror records it and sends it to the TV.
+//
+// It uses CGVirtualDisplay, a built-in but undocumented part of macOS's CoreGraphics
+// (the same thing apps like DeskPad use). The screen exists for as long as this
+// program runs; when it quits, the screen disappears and its windows move back.
+//
+// Build:  clang -fobjc-arc -framework Foundation -framework CoreGraphics vdisplay.m -o vdisplay
+// Run:    ./vdisplay 1920 1080        (prints the new screen's display ID)
+
+#import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+// ---- Declarations for the undocumented CoreGraphics classes ----------------
+
+@class CGVirtualDisplay;
+
+@interface CGVirtualDisplayDescriptor : NSObject
+- (void)setDispatchQueue:(dispatch_queue_t)queue;
+@property (retain, nonatomic) NSString *name;
+@property (nonatomic) unsigned int maxPixelsHigh;
+@property (nonatomic) unsigned int maxPixelsWide;
+@property (nonatomic) CGSize sizeInMillimeters;
+@property (nonatomic) unsigned int serialNum;
+@property (nonatomic) unsigned int productID;
+@property (nonatomic) unsigned int vendorID;
+@property (copy, nonatomic) void (^terminationHandler)(id, CGVirtualDisplay *);
+@end
+
+@interface CGVirtualDisplayMode : NSObject
+- (instancetype)initWithWidth:(NSUInteger)width height:(NSUInteger)height refreshRate:(double)refreshRate;
+@end
+
+@interface CGVirtualDisplaySettings : NSObject
+@property (retain, nonatomic) NSArray *modes;
+@property (nonatomic) unsigned int hiDPI;
+@end
+
+@interface CGVirtualDisplay : NSObject
+- (instancetype)initWithDescriptor:(CGVirtualDisplayDescriptor *)descriptor;
+- (BOOL)applySettings:(CGVirtualDisplaySettings *)settings;
+@property (readonly, nonatomic) unsigned int displayID;
+@end
+
+// ---------------------------------------------------------------------------
+
+static void quit(int sig) { (void)sig; exit(0); }
+
+int main(int argc, const char *argv[]) {
+    @autoreleasepool {
+        unsigned int width  = argc > 1 ? (unsigned int)atoi(argv[1]) : 1920;
+        unsigned int height = argc > 2 ? (unsigned int)atoi(argv[2]) : 1080;
+        if (width < 640 || height < 480) { width = 1920; height = 1080; }
+
+        Class Descriptor = NSClassFromString(@"CGVirtualDisplayDescriptor");
+        Class Display    = NSClassFromString(@"CGVirtualDisplay");
+        Class Settings   = NSClassFromString(@"CGVirtualDisplaySettings");
+        Class Mode       = NSClassFromString(@"CGVirtualDisplayMode");
+        if (!Descriptor || !Display || !Settings || !Mode) {
+            fprintf(stderr, "This version of macOS doesn't support virtual displays.\n");
+            return 2;
+        }
+
+        CGVirtualDisplayDescriptor *descriptor = [[Descriptor alloc] init];
+        [descriptor setDispatchQueue:dispatch_get_main_queue()];
+        descriptor.name = @"TV Mirror Display";
+        descriptor.maxPixelsWide = width;
+        descriptor.maxPixelsHigh = height;
+        descriptor.sizeInMillimeters = CGSizeMake(width * 0.37, height * 0.37);  // like a ~32" TV
+        descriptor.vendorID = 0x7456;   // made-up IDs so macOS remembers this "monitor"
+        descriptor.productID = 0x4D52;
+        descriptor.serialNum = 0x0001;
+        descriptor.terminationHandler = ^(id unused, CGVirtualDisplay *display) {
+            fprintf(stderr, "The virtual screen was removed by macOS.\n");
+            exit(1);
+        };
+
+        CGVirtualDisplay *display = [[Display alloc] initWithDescriptor:descriptor];
+        if (!display || display.displayID == 0) {
+            fprintf(stderr, "Couldn't create the virtual screen.\n");
+            return 3;
+        }
+
+        CGVirtualDisplaySettings *settings = [[Settings alloc] init];
+        settings.hiDPI = 0;   // 1 screen pixel = 1 TV pixel
+        settings.modes = @[ [[Mode alloc] initWithWidth:width height:height refreshRate:60] ];
+        if (![display applySettings:settings]) {
+            fprintf(stderr, "Couldn't set the virtual screen to %ux%u.\n", width, height);
+            return 4;
+        }
+
+        printf("%u\n", display.displayID);
+        fflush(stdout);
+
+        signal(SIGTERM, quit);
+        signal(SIGINT, quit);
+        // Keep running (and keep the screen alive) until TV Mirror stops us.
+        [[NSRunLoop mainRunLoop] run];
+    }
+    return 0;
+}
+'''
+
+
+def build_vdisplay():
+    """Compile the virtual-screen helper once and return its path (or None)."""
+    build_dir = os.path.join(os.path.expanduser("~"), ".tv-mirror-build")
+    digest = hashlib.sha1(VDISPLAY_SOURCE.encode()).hexdigest()[:10]
+    exe = os.path.join(build_dir, f"vdisplay-{digest}")
+    if os.path.exists(exe):
+        return exe
+    clang = shutil.which("clang")
+    if not clang:
+        print("Building the virtual screen needs Apple's developer tools. Run:\n"
+              "  xcode-select --install\nthen try again.")
+        return None
+    os.makedirs(build_dir, exist_ok=True)
+    src = os.path.join(build_dir, "vdisplay.m")
+    with open(src, "w") as f:
+        f.write(VDISPLAY_SOURCE)
+    print("Building the virtual screen helper (first time only)...")
+    result = subprocess.run(
+        [clang, "-fobjc-arc", "-framework", "Foundation", "-framework", "CoreGraphics",
+         src, "-o", exe],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print("Couldn't build the virtual screen helper:\n" + result.stderr)
+        return None
+    return exe
+
+
+def start_virtual_display(size):
+    """Create the invisible screen. Returns (process, ffmpeg screen name) or (None, None)."""
+    if sys.platform != "darwin":
+        print("The virtual screen only works on a Mac.")
+        return None, None
+    try:
+        width, height = (int(n) for n in size.lower().split("x"))
+    except ValueError:
+        width, height = 1920, 1080
+    exe = build_vdisplay()
+    if not exe:
+        return None, None
+
+    before = set(list_devices()[0])
+    proc = subprocess.Popen([exe, str(width), str(height)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    ready, _, _ = select.select([proc.stdout], [], [], 10)
+    display_id = proc.stdout.readline().strip() if ready else ""
+    if not display_id.isdigit():
+        if proc.poll() is None:
+            proc.terminate()
+        err = proc.stderr.read().strip()
+        print("Couldn't create the virtual screen." + (f"\n{err}" if err else ""))
+        return None, None
+
+    # Wait for ffmpeg to see the new screen
+    for _ in range(20):
+        new = [s for s in list_devices()[0] if s not in before]
+        if new:
+            return proc, new[-1]
+        time.sleep(0.5)
+    proc.terminate()
+    print("The virtual screen was created, but screen recording can't see it.")
+    return None, None
+
+
+# --------------------------------------------------------------------------- #
 # Main program
 # --------------------------------------------------------------------------- #
 
@@ -582,6 +764,11 @@ def main():
                    help="lag reducer: pads the stream to this rate (e.g. 25M) so the TV holds "
                         "fewer seconds of video. Higher = less lag but needs better Wi-Fi. "
                         "0 turns it off. Change it live with + and -")
+    p.add_argument("--virtual-display", action="store_true",
+                   help="add an invisible extra screen and mirror that, so you can keep "
+                        "working on your other desktops")
+    p.add_argument("--virtual-size", default="1920x1080",
+                   help="size of the virtual screen (default 1920x1080)")
     p.add_argument("--show-clock", action="store_true",
                    help="show a clock on the TV picture so you can measure the delay")
     p.add_argument("--auto-reset", type=float, default=0, metavar="MINUTES",
@@ -623,6 +810,19 @@ def main():
         print("Screens:", *(screens or ["(none found - check Screen Recording permission)"]), sep="\n  ")
         print("Audio devices:", *(audio or ["(none)"]), sep="\n  ")
         return
+
+    vd_screen = None
+    if args.virtual_display and not args.test_pattern:
+        vd_proc, vd_screen = start_virtual_display(args.virtual_size)
+        if not vd_proc:
+            sys.exit(1)
+        atexit.register(lambda: vd_proc.poll() is None and vd_proc.terminate())
+        args.screen = vd_screen
+        print("\nAdded an invisible screen called 'TV Mirror Display'. Whatever is on it\n"
+              "goes to the TV, while you keep working on your normal screen and desktops.\n"
+              "To put a window on the TV: hover over its green button and choose\n"
+              "'Move to TV Mirror Display' (or drag it off the right edge of your screen).\n"
+              "When TV Mirror quits, the screen disappears and its windows come back.\n")
 
     if not args.test_pattern:
         args.screen = choose_screen(args.screen)
@@ -681,6 +881,8 @@ def main():
         what = "test pattern" if args.test_pattern else args.screen.replace("Capture screen ", "screen ")
         if not args.test_pattern and args.screen.startswith("Capture screen "):
             what = f"screen {int(args.screen.split()[-1]) + 1}"
+        if vd_screen and args.screen == vd_screen:
+            what += " (TV Mirror Display)"
         boost = f"{args.boost}M" if args.boost else "off"
         log(f"  Now showing: {what}  |  lag reducer: {boost}")
 
