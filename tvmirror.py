@@ -23,11 +23,14 @@ import http.server
 import os
 import queue
 import re
+import select
 import shutil
 import socket
 import socketserver
 import subprocess
 import sys
+import termios
+import tty
 import threading
 import time
 import urllib.error
@@ -40,6 +43,12 @@ APP_NAME = "TV Mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
 TS_PACKET = 188
+CLOCK_FONTS = [
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
 VIDEO_PID = 0x100   # ffmpeg's default IDs for the first track and the stream map
 PMT_PID = 0x1000
 STREAM_PATH = "/screen.ts"
@@ -245,7 +254,13 @@ def ffmpeg_command(args):
         cmd += ["-re", "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
 
     cmd += ["-map", "0:v:0", "-map", "0:a:0" if has_real_audio else "1:a:0"]
-    cmd += ["-vf", f"scale=-2:{args.height}:flags=bicubic,format=yuv420p"]
+    vf = f"scale=-2:{args.height}:flags=bicubic"
+    if args.show_clock:
+        font = next((f for f in CLOCK_FONTS if os.path.exists(f)), None)
+        font_opt = f"fontfile='{font}':" if font else ""
+        vf += (",drawtext=" + font_opt + "text='%{localtime\\:%T}':fontsize=h/14:"
+               "fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12:x=w-tw-30:y=30")
+    cmd += ["-vf", vf + ",format=yuv420p"]
 
     if args.encoder == "hardware":
         cmd += ["-c:v", "h264_videotoolbox", "-realtime", "1", "-allow_sw", "1",
@@ -260,11 +275,11 @@ def ffmpeg_command(args):
         "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
         "-f", "mpegts", "-mpegts_flags", "+pat_pmt_at_frames",
     ]
-    if args.boost and args.boost != "0":
+    if args.boost:
         # Lag fix: TVs fill a fixed-size buffer (in bytes) before they start playing.
         # Padding the stream with empty "filler" packets fills it faster, so the TV
         # holds fewer seconds of video -> less delay. The TV throws the filler away.
-        cmd += ["-muxrate", args.boost]
+        cmd += ["-muxrate", f"{args.boost}M"]
     cmd += [
         "-muxdelay", "0", "-flush_packets", "1",
         "pipe:1",
@@ -351,7 +366,19 @@ class Broadcaster:
             if usable:
                 self.publish(buf[:usable])
                 buf = buf[usable:]
-        self.close()
+
+    def disconnect_all(self):
+        """Hang up on every viewer (they reconnect fresh, with no backlog)."""
+        with self.lock:
+            clients = list(self.clients)
+            self.clients.clear()
+        for q in clients:
+            with q.mutex:
+                q.queue.clear()
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
 
 
 BROADCASTER = Broadcaster()
@@ -422,6 +449,10 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
             return
         limit = self._send_headers()
+        try:
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
+        except OSError:
+            pass
         q = BROADCASTER.subscribe()
         print(f"  -> {self.client_address[0]} connected to the stream")
         sent, began, reason = 0, time.time(), "TV closed the connection"
@@ -540,8 +571,13 @@ def main():
     p.add_argument("--tv", help="TV name (or part of it) or IP address")
     p.add_argument("--screen", help="which screen to mirror: 1, 2, ... (default: asks if you have more than one)")
     p.add_argument("--boost", default="25M",
-                   help="lag reducer: pads the stream to this rate so the TV starts sooner. "
-                        "Higher = less lag but needs better Wi-Fi. 0 turns it off (default 25M)")
+                   help="lag reducer: pads the stream to this rate (e.g. 25M) so the TV holds "
+                        "fewer seconds of video. Higher = less lag but needs better Wi-Fi. "
+                        "0 turns it off. Change it live with + and -")
+    p.add_argument("--show-clock", action="store_true",
+                   help="show a clock on the TV picture so you can measure the delay")
+    p.add_argument("--auto-reset", type=float, default=0, metavar="MINUTES",
+                   help="reset the delay automatically every N minutes (like pressing R)")
     p.add_argument("--audio-device", help='audio input to send, e.g. "BlackHole 2ch" (default: silent)')
     p.add_argument("--fps", type=int, default=30, help="frames per second (default 30)")
     p.add_argument("--height", type=int, default=1080, help="video height, e.g. 720 or 1080 (default 1080)")
@@ -581,18 +617,60 @@ def main():
     my_ip = local_ip_for(tv["host"] if tv else "8.8.8.8")
     url = f"http://{my_ip}:{args.port}{STREAM_PATH}"
 
-    # Start capturing and encoding the screen
-    cmd = ffmpeg_command(args)
-    ffmpeg = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
-    threading.Thread(target=BROADCASTER.pump, args=(ffmpeg.stdout,), daemon=True).start()
+    try:
+        args.boost = int(float(str(args.boost).upper().rstrip("M") or 0))
+    except ValueError:
+        args.boost = 25
+    screens = [] if args.test_pattern else list_devices()[0]
 
     # Start the little web server the TV will read from
     server = StreamServer(("0.0.0.0", args.port), StreamHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    print(f"\nStreaming {'test pattern' if args.test_pattern else args.screen} at {url}")
-    time.sleep(1.5)
-    if ffmpeg.poll() is not None:
+    capture = {"proc": None}
+
+    def start_capture():
+        proc = subprocess.Popen(ffmpeg_command(args), stdout=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL)
+        threading.Thread(target=BROADCASTER.pump, args=(proc.stdout,), daemon=True).start()
+        capture["proc"] = proc
+        time.sleep(1.5)
+        return proc.poll() is None
+
+    def stop_capture():
+        proc = capture["proc"]
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def play_on_tv():
+        if tv:
+            tv_play(tv, url)
+
+    def reset_lag(restart_video=False):
+        """Make the TV start over from 'now', which throws away its built-up delay."""
+        if restart_video:
+            stop_capture()
+        BROADCASTER.disconnect_all()
+        if restart_video and not start_capture():
+            return False
+        try:
+            play_on_tv()
+        except Exception as e:
+            print(f"  TV didn't respond: {e}")
+        return True
+
+    def status():
+        what = "test pattern" if args.test_pattern else args.screen.replace("Capture screen ", "screen ")
+        if not args.test_pattern and args.screen.startswith("Capture screen "):
+            what = f"screen {int(args.screen.split()[-1]) + 1}"
+        boost = f"{args.boost}M" if args.boost else "off"
+        print(f"  Now showing: {what}  |  lag reducer: {boost}")
+
+    if not start_capture():
         print("\nScreen capture failed to start. If you see a permission error above:\n"
               "  System Settings > Privacy & Security > Screen Recording > turn ON Terminal\n"
               "  (then quit and reopen Terminal). If the error mentions videotoolbox,\n"
@@ -600,38 +678,116 @@ def main():
         server.shutdown()
         sys.exit(1)
 
+    print(f"\nStreaming at {url}")
     if tv:
         print(f"Sending to: {tv['name']} ({tv['host']})")
         try:
-            tv_play(tv, url)
+            play_on_tv()
         except Exception as e:
             print(f"\n{e}\nThe TV didn't accept the stream. Try:  --encoder software --height 720")
-            ffmpeg.terminate()
+            stop_capture()
             server.shutdown()
             sys.exit(1)
-        print("Mirroring! It can take a few seconds to appear. Press Ctrl+C to stop.")
+        print("Mirroring! It can take a few seconds to appear.")
     else:
-        print("Serve-only mode: open the URL above in VLC (File > Open Network). Ctrl+C to stop.")
+        print("Serve-only mode: open the URL above in VLC (File > Open Network).")
 
+    print("\nControls (press a key in this window):")
+    if len(screens) > 1:
+        print(f"  1-{min(len(screens), 9)}  switch to that screen")
+    print("  R    reset the delay (TV restarts from 'now'; do this if it falls behind)\n"
+          "  +/-  more / less lag reduction (more = less delay, needs better Wi-Fi)\n"
+          "  Q    quit")
+    status()
+
+    keys = KeyReader()
+    last_reset = time.time()
     try:
-        while ffmpeg.poll() is None:
-            time.sleep(0.5)
-        print("\nScreen capture stopped unexpectedly.")
+        with keys:
+            while True:
+                if capture["proc"].poll() is not None:
+                    print("\nScreen capture stopped unexpectedly.")
+                    break
+                key = keys.read(0.5)
+                if args.auto_reset and time.time() - last_reset > args.auto_reset * 60:
+                    key, auto = "r", True
+                else:
+                    auto = False
+                if not key:
+                    continue
+                key = key.lower()
+                if key == "q":
+                    break
+                elif key == "r":
+                    print("  Resetting the delay..." if not auto else "  Auto-reset of the delay...")
+                    reset_lag()
+                    last_reset = time.time()
+                elif key in "+=-_":
+                    old = args.boost
+                    if key in "+=":
+                        args.boost = max(args.boost + 5, 15)
+                    else:
+                        args.boost = args.boost - 5 if args.boost > 15 else 0
+                    if args.boost == old:
+                        continue
+                    print("  Changing lag reducer...")
+                    if not reset_lag(restart_video=True):
+                        print("  That setting didn't work; going back.")
+                        args.boost = old
+                        reset_lag(restart_video=True)
+                    last_reset = time.time()
+                    status()
+                elif key.isdigit() and screens:
+                    n = int(key)
+                    if not 1 <= n <= len(screens):
+                        print(f"  There's no screen {n}; you have {len(screens)}.")
+                        continue
+                    if screens[n - 1] == args.screen:
+                        continue
+                    old = args.screen
+                    args.screen = screens[n - 1]
+                    print(f"  Switching to screen {n}...")
+                    if not reset_lag(restart_video=True):
+                        print("  Couldn't capture that screen; going back.")
+                        args.screen = old
+                        reset_lag(restart_video=True)
+                    last_reset = time.time()
+                    status()
     except KeyboardInterrupt:
-        print("\nStopping...")
+        pass
     finally:
+        print("\nStopping...")
         if tv:
             tv_stop(tv)
         BROADCASTER.close()
-        if ffmpeg.poll() is None:
-            ffmpeg.terminate()
-            try:
-                ffmpeg.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                ffmpeg.kill()
+        stop_capture()
         server.shutdown()
         print("Stopped.")
 
+
+class KeyReader:
+    """Reads single key presses from the Terminal without needing Enter."""
+
+    def __init__(self):
+        self.fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+        self.saved = None
+
+    def __enter__(self):
+        if self.fd is not None:
+            self.saved = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *exc):
+        if self.saved is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+    def read(self, timeout):
+        if self.fd is None:
+            time.sleep(timeout)
+            return ""
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        return os.read(self.fd, 1).decode(errors="ignore") if ready else ""
 
 if __name__ == "__main__":
     main()

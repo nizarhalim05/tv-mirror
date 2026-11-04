@@ -29,7 +29,18 @@ KDL-32WD754 (2016).
 2. Double-click **TV Mirror** on your Desktop.
 3. If you have more than one screen, type the number of the one to mirror.
 4. Your screen appears on the TV after a few seconds.
-5. To stop, press **Ctrl+C** or close the window.
+5. To stop, press **Q** (or close the window).
+
+## Controls while it's running
+
+Click the TV Mirror (Terminal) window, then press:
+
+| Key | What it does |
+|---|---|
+| **1**, **2**, **3**... | Switch to that screen |
+| **R** | Reset the delay: the TV starts again from "now" |
+| **+** / **-** | More / less lag reduction (more = less delay, needs better Wi-Fi) |
+| **Q** | Quit |
 
 **First time only:** macOS asks for **Screen Recording** permission. Go to
 System Settings > Privacy & Security > Screen Recording, turn on **Terminal**,
@@ -44,6 +55,8 @@ Run these in Terminal, inside the `~/tv-mirror` folder (`cd ~/tv-mirror`):
 |---|---|
 | `python3 tvmirror.py --screen 2` | Mirror screen 2 without asking |
 | `python3 tvmirror.py --boost 32M` | Less lag (needs good Wi-Fi). Default is `25M`; `0` turns it off |
+| `python3 tvmirror.py --show-clock` | Show a clock on the TV so you can measure the delay |
+| `python3 tvmirror.py --auto-reset 5` | Reset the delay automatically every 5 minutes |
 | `python3 tvmirror.py --tv "Bravia"` | Pick a TV by name or IP address if you have several |
 | `python3 tvmirror.py --height 720` | Lower quality, smoother on weak Wi-Fi |
 | `python3 tvmirror.py --encoder software` | Try this if the TV says it can't play the video |
@@ -58,8 +71,18 @@ delay. TV Mirror pads the video with filler data the TV throws away, so that
 chunk fills up much faster, which cuts the delay to a fraction of what it
 would be otherwise.
 
-- Still too much delay? Try `--boost 32M` or `--boost 40M`.
-- Picture freezing or stuttering? Your Wi-Fi can't keep up; try `--boost 15M`.
+**To find the best setting for your TV:**
+
+1. Start with `python3 tvmirror.py --show-clock`. A clock appears in the
+   corner of the TV picture.
+2. Compare it with the real time (on your phone). The difference is your delay.
+3. Press **+** a few times (wait for the picture to come back each time) until
+   the delay is small. If the picture starts stuttering, press **-** once.
+
+**If the delay keeps growing** the longer it runs, your Wi-Fi isn't keeping up.
+Press **R** to snap it back, lower the boost with **-**, or use
+`--auto-reset 5` to reset it automatically every 5 minutes. Moving the Mac
+closer to the router, or using `--height 720`, also helps.
 
 It's fine for videos, slideshows and presentations, but not for gaming.
 
