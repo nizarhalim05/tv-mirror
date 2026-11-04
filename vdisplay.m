@@ -95,8 +95,39 @@ int main(int argc, const char *argv[]) {
             return 4;
         }
 
-        printf("%u\n", display.displayID);
+        CGDirectDisplayID newID = display.displayID;
+
+        // macOS sometimes adds a new screen as a *mirror* of the main one.
+        // A mirror isn't a separate screen, so switch that off.
+        if (CGDisplayIsInMirrorSet(newID)) {
+            CGDisplayConfigRef config;
+            if (CGBeginDisplayConfiguration(&config) == kCGErrorSuccess) {
+                CGConfigureDisplayMirrorOfDisplay(config, newID, kCGNullDirectDisplay);
+                CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
+            }
+        }
+
+        printf("%u\n", newID);
         fflush(stdout);
+
+        // Two seconds later, report how macOS sees the new screen (for troubleshooting).
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            CGDirectDisplayID online[16], active[16];
+            uint32_t nOnline = 0, nActive = 0;
+            CGGetOnlineDisplayList(16, online, &nOnline);
+            CGGetActiveDisplayList(16, active, &nActive);
+            int isOnline = 0, isActive = 0;
+            for (uint32_t i = 0; i < nOnline; i++) if (online[i] == newID) isOnline = 1;
+            for (uint32_t i = 0; i < nActive; i++) if (active[i] == newID) isActive = 1;
+            CGRect b = CGDisplayBounds(newID);
+            fprintf(stderr,
+                    "[vdisplay] id=%u online=%d active=%d mirrored=%d asleep=%d size=%.0fx%.0f at %.0f,%.0f "
+                    "| online screens=%u active screens=%u\n",
+                    newID, isOnline, isActive, (int)CGDisplayIsInMirrorSet(newID),
+                    (int)CGDisplayIsAsleep(newID), b.size.width, b.size.height, b.origin.x, b.origin.y,
+                    nOnline, nActive);
+            fflush(stderr);
+        });
 
         signal(SIGTERM, quit);
         signal(SIGINT, quit);
