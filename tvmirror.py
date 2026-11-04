@@ -886,18 +886,23 @@ def choose_screen(wanted):
 def self_update():
     """Replace this file with the newest tvmirror.py from GitHub."""
     me = os.path.abspath(__file__)
+    def fetch(url):
+        return subprocess.run(["curl", "-fsSL", url], capture_output=True, timeout=60).stdout
+
+    new = b""
     try:
         # Ask GitHub for the newest version's ID first: the plain download link can
         # serve an old copy for a few minutes after an update.
-        info = subprocess.run(["curl", "-fsSL", f"https://api.github.com/repos/{REPO}/commits/main"],
-                              capture_output=True, text=True, timeout=20)
-        sha = json.loads(info.stdout)["sha"]
-        new = subprocess.run(["curl", "-fsSL",
-                              f"https://raw.githubusercontent.com/{REPO}/{sha}/tvmirror.py"],
-                             capture_output=True, timeout=60).stdout
-    except Exception as e:
-        print(f"Couldn't download the update ({e}). Check your internet connection.")
-        return 1
+        sha = json.loads(fetch(f"https://api.github.com/repos/{REPO}/commits/main"))["sha"]
+        new = fetch(f"https://raw.githubusercontent.com/{REPO}/{sha}/tvmirror.py")
+    except Exception:
+        pass
+    if b"def main()" not in new:
+        try:
+            new = fetch(f"https://raw.githubusercontent.com/{REPO}/main/tvmirror.py")
+        except Exception as e:
+            print(f"Couldn't download the update ({e}). Check your internet connection.")
+            return 1
     if b"def main()" not in new:
         print("The download didn't look right, so nothing was changed.")
         return 1
