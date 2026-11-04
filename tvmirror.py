@@ -49,6 +49,7 @@ CLOCK_FONTS = [
     "/System/Library/Fonts/Helvetica.ttc",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 ]
+HAS_DRAWTEXT = False   # set at startup: can this ffmpeg draw text on the video?
 VIDEO_PID = 0x100   # ffmpeg's default IDs for the first track and the stream map
 PMT_PID = 0x1000
 STREAM_PATH = "/screen.ts"
@@ -244,6 +245,7 @@ def ffmpeg_command(args):
         audio = args.audio_device or "none"
         cmd += [
             "-f", "avfoundation", "-capture_cursor", "1",
+            "-pixel_format", "nv12",
             "-framerate", str(args.fps),
             "-i", f"{args.screen}:{audio}",
         ]
@@ -255,7 +257,7 @@ def ffmpeg_command(args):
 
     cmd += ["-map", "0:v:0", "-map", "0:a:0" if has_real_audio else "1:a:0"]
     vf = f"scale=-2:{args.height}:flags=bicubic"
-    if args.show_clock:
+    if args.show_clock and HAS_DRAWTEXT:
         font = next((f for f in CLOCK_FONTS if os.path.exists(f)), None)
         font_opt = f"fontfile='{font}':" if font else ""
         vf += (",drawtext=" + font_opt + "text='%{localtime\\:%T}':fontsize=h/14:"
@@ -384,6 +386,12 @@ class Broadcaster:
 BROADCASTER = Broadcaster()
 
 
+def log(msg):
+    """Print a message on its own line (clears the ticking clock line first)."""
+    sys.stdout.write("\r\033[K" + msg + "\n")
+    sys.stdout.flush()
+
+
 class StreamHandler(http.server.BaseHTTPRequestHandler):
     """Serves the live video. Settings below are changed by command-line options."""
     server_version = "TVMirror/1.0"
@@ -454,7 +462,7 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
         except OSError:
             pass
         q = BROADCASTER.subscribe()
-        print(f"  -> {self.client_address[0]} connected to the stream")
+        log(f"  -> {self.client_address[0]} connected to the stream")
         sent, began, reason = 0, time.time(), "TV closed the connection"
         try:
             while True:
@@ -478,7 +486,7 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
             extra = ""
             if self.debug:
                 extra = f" after {time.time() - began:.1f}s, {sent / 1024:.0f} KB sent ({reason})"
-            print(f"  <- {self.client_address[0]} disconnected{extra}")
+            log(f"  <- {self.client_address[0]} disconnected{extra}")
 
     def log_message(self, fmt, *args):
         pass  # keep the terminal quiet
@@ -604,6 +612,12 @@ def main():
         print("ffmpeg is not installed. Install it with:  brew install ffmpeg")
         sys.exit(1)
 
+    global HAS_DRAWTEXT
+    filters = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
+                             capture_output=True, text=True).stdout
+    HAS_DRAWTEXT = re.search(r"\sdrawtext\s", filters) is not None
+    terminal_clock = args.show_clock and not HAS_DRAWTEXT
+
     if args.list_devices:
         screens, audio = list_devices()
         print("Screens:", *(screens or ["(none found - check Screen Recording permission)"]), sep="\n  ")
@@ -668,7 +682,7 @@ def main():
         if not args.test_pattern and args.screen.startswith("Capture screen "):
             what = f"screen {int(args.screen.split()[-1]) + 1}"
         boost = f"{args.boost}M" if args.boost else "off"
-        print(f"  Now showing: {what}  |  lag reducer: {boost}")
+        log(f"  Now showing: {what}  |  lag reducer: {boost}")
 
     if not start_capture():
         print("\nScreen capture failed to start. If you see a permission error above:\n"
@@ -692,6 +706,10 @@ def main():
     else:
         print("Serve-only mode: open the URL above in VLC (File > Open Network).")
 
+    if terminal_clock:
+        print("\nThe clock below is also on the TV (it's part of your screen). Make sure this\n"
+              "window is visible on the screen you're mirroring. The difference between the\n"
+              "two clocks is your delay.")
     print("\nControls (press a key in this window):")
     if len(screens) > 1:
         print(f"  1-{min(len(screens), 9)}  switch to that screen")
@@ -706,9 +724,13 @@ def main():
         with keys:
             while True:
                 if capture["proc"].poll() is not None:
-                    print("\nScreen capture stopped unexpectedly.")
+                    log("\nScreen capture stopped unexpectedly.")
                     break
-                key = keys.read(0.5)
+                key = keys.read(0.25)
+                if terminal_clock:
+                    sys.stdout.write("\r\033[K  Mac clock: " + time.strftime("%H:%M:%S") +
+                                     "   <- compare with the same clock on the TV")
+                    sys.stdout.flush()
                 if args.auto_reset and time.time() - last_reset > args.auto_reset * 60:
                     key, auto = "r", True
                 else:
@@ -719,7 +741,7 @@ def main():
                 if key == "q":
                     break
                 elif key == "r":
-                    print("  Resetting the delay..." if not auto else "  Auto-reset of the delay...")
+                    log("  Resetting the delay..." if not auto else "  Auto-reset of the delay...")
                     reset_lag()
                     last_reset = time.time()
                 elif key in "+=-_":
@@ -730,9 +752,9 @@ def main():
                         args.boost = args.boost - 5 if args.boost > 15 else 0
                     if args.boost == old:
                         continue
-                    print("  Changing lag reducer...")
+                    log("  Changing lag reducer...")
                     if not reset_lag(restart_video=True):
-                        print("  That setting didn't work; going back.")
+                        log("  That setting didn't work; going back.")
                         args.boost = old
                         reset_lag(restart_video=True)
                     last_reset = time.time()
@@ -740,15 +762,15 @@ def main():
                 elif key.isdigit() and screens:
                     n = int(key)
                     if not 1 <= n <= len(screens):
-                        print(f"  There's no screen {n}; you have {len(screens)}.")
+                        log(f"  There's no screen {n}; you have {len(screens)}.")
                         continue
                     if screens[n - 1] == args.screen:
                         continue
                     old = args.screen
                     args.screen = screens[n - 1]
-                    print(f"  Switching to screen {n}...")
+                    log(f"  Switching to screen {n}...")
                     if not reset_lag(restart_video=True):
-                        print("  Couldn't capture that screen; going back.")
+                        log("  Couldn't capture that screen; going back.")
                         args.screen = old
                         reset_lag(restart_video=True)
                     last_reset = time.time()
@@ -756,13 +778,13 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        print("\nStopping...")
+        log("\nStopping...")
         if tv:
             tv_stop(tv)
         BROADCASTER.close()
         stop_capture()
         server.shutdown()
-        print("Stopped.")
+        log("Stopped.")
 
 
 class KeyReader:
