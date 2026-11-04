@@ -23,6 +23,14 @@ KDL-32WD754 (2016).
 **Prefer to do it by hand?** Install ffmpeg with `brew install ffmpeg`, download
 [`tvmirror.py`](tvmirror.py), and run `python3 tvmirror.py` in the folder you saved it to.
 
+## Update to the newest version
+
+```
+python3 ~/tv-mirror/tvmirror.py --update
+```
+
+TV Mirror prints its version number when it starts, so you can check.
+
 ## Use it
 
 1. Turn on your TV and make sure it's on the **same Wi-Fi** as your Mac.
@@ -61,7 +69,8 @@ Click the TV Mirror (Terminal) window, then press:
 |---|---|
 | **1**, **2**, **3**... | Switch to that screen |
 | **R** | Reset the delay: the TV starts again from "now" |
-| **+** / **-** | More / less lag reduction (more = less delay, needs better Wi-Fi) |
+| **+** / **-** | Bigger / smaller stream (bigger = less delay, needs better Wi-Fi) |
+| **M** | Switch between "sony" and "live" mode, to see which has less delay on your TV |
 | **Q** | Quit |
 
 **First time only:** macOS asks for **Screen Recording** permission. Go to
@@ -75,39 +84,53 @@ Run these in Terminal, inside the `~/tv-mirror` folder (`cd ~/tv-mirror`):
 
 | Command | What it does |
 |---|---|
+| `python3 tvmirror.py --update` | Download the newest version from GitHub |
 | `python3 tvmirror.py --screen 2` | Mirror screen 2 without asking |
-| `python3 tvmirror.py --boost 32M` | Less lag (needs good Wi-Fi). Default is `25M`; `0` turns it off |
+| `python3 tvmirror.py --rate 12` | Stream size in Mbit/s (default 8). Bigger = less delay, needs better Wi-Fi |
 | `python3 tvmirror.py --virtual-display` | Add an invisible extra screen for the TV (see above) |
 | `python3 tvmirror.py --show-clock` | Show a clock on the TV so you can measure the delay |
 | `python3 tvmirror.py --auto-reset 5` | Reset the delay automatically every 5 minutes |
 | `python3 tvmirror.py --tv "Bravia"` | Pick a TV by name or IP address if you have several |
 | `python3 tvmirror.py --height 720` | Lower quality, smoother on weak Wi-Fi |
-| `python3 tvmirror.py --encoder software` | Try this if the TV says it can't play the video |
+| `python3 tvmirror.py --mode live` | Tell the TV it's a live broadcast instead of a long video file |
+| `python3 tvmirror.py --encoder hardware` | Use the Mac's video chip: less CPU, but more delay on still screens |
 | `python3 tvmirror.py --mode stream` | For newer TVs that don't like the default Sony mode |
 | `python3 tvmirror.py --debug` | Show what the TV is asking for (for troubleshooting) |
 | `python3 tvmirror.py --test-pattern` | Send a moving test picture instead of your screen |
 
 ## About the delay
 
-The TV saves up a chunk of video before it starts playing, which causes the
-delay. TV Mirror pads the video with filler data the TV throws away, so that
-chunk fills up much faster, which cuts the delay to a fraction of what it
-would be otherwise.
+**Why there's a delay:** many TVs, including older Sonys, collect a fixed
+*amount of data* before they start playing. A normal video encoder makes very
+little data for a still screen (about 60 kbit/s instead of 8,000), and silent
+sound is even smaller, so the TV can end up waiting 20-40 seconds to collect
+enough. An empty extra screen is the worst case.
 
-**To find the best setting for your TV:**
+**What TV Mirror does about it:** it keeps the video and the sound at a
+constant size, topping every frame up with filler data the TV throws away
+(H.264 filler units and AC-3 audio). The TV's buffer then fills in a fraction
+of a second, however still your screen is.
 
-1. Start with `python3 tvmirror.py --show-clock`. A clock appears in the
-   corner of the TV picture.
-2. Compare it with the real time (on your phone). The difference is your delay.
-3. Press **+** a few times (wait for the picture to come back each time) until
-   the delay is small. If the picture starts stuttering, press **-** once.
+**Fine-tuning for your TV:**
 
-**If the delay keeps growing** the longer it runs, your Wi-Fi isn't keeping up.
-Press **R** to snap it back, lower the boost with **-**, or use
+1. Start with `python3 tvmirror.py --show-clock` and keep the Terminal window
+   visible on the mirrored screen. Compare the clock in Terminal with the same
+   clock on the TV: the difference is your delay.
+2. Press **R** to start from "now", then press **+** a couple of times (wait for
+   the picture to come back each time). A bigger stream fills the TV's buffer
+   faster.
+3. If TV Mirror says the TV *can't keep up*, your Wi-Fi is the limit: press
+   **-** once.
+4. Press **M** to try "live" mode, which tells the TV it's a live broadcast.
+   Some TVs keep a smaller buffer for live broadcasts. Keep whichever is faster.
+
+**If the delay keeps growing** the longer it runs, press **R**, or use
 `--auto-reset 5` to reset it automatically every 5 minutes. Moving the Mac
-closer to the router, or using `--height 720`, also helps.
+closer to the router (or connecting the TV with a network cable) helps.
 
-It's fine for videos, slideshows and presentations, but not for gaming.
+Expect a few seconds at best: DLNA was designed for playing films, not live
+screens. It's great for videos, slides and dashboards, but not for gaming. For
+zero delay, use an HDMI cable.
 
 ## Sound
 
@@ -133,8 +156,8 @@ the TV gets the picture with silence. To send sound too:
 
 ## How it works
 
-1. **ffmpeg** captures the screen (AVFoundation) and encodes H.264 with the
-   Mac's hardware encoder (VideoToolbox) into an MPEG-TS stream.
+1. **ffmpeg** captures the screen (AVFoundation) and encodes constant-bitrate
+   H.264 (x264 with filler data) plus AC-3 audio into an MPEG-TS stream.
 2. A small web server built into the script serves the stream on port 8090.
    For older Sony TVs it pretends the stream is a very long video file, since
    they refuse endless streams.

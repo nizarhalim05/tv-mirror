@@ -21,6 +21,7 @@ Press Ctrl+C to stop.
 import argparse
 import atexit
 import hashlib
+import json
 import http.server
 import os
 import queue
@@ -42,6 +43,8 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 APP_NAME = "TV Mirror"
+VERSION = "1.5"
+REPO = "nizarhalim05/tv-mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
 TS_PACKET = 188
@@ -51,6 +54,7 @@ CLOCK_FONTS = [
     "/System/Library/Fonts/Helvetica.ttc",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 ]
+RATE_STEPS = [2, 3, 4, 6, 8, 10, 12, 15, 20, 25, 30]   # Mbit/s choices for + and -
 HAS_DRAWTEXT = False   # set at startup: can this ffmpeg draw text on the video?
 VIDEO_PID = 0x100   # ffmpeg's default IDs for the first track and the stream map
 PMT_PID = 0x1000
@@ -266,24 +270,36 @@ def ffmpeg_command(args):
                "fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12:x=w-tw-30:y=30")
     cmd += ["-vf", vf + ",format=yuv420p"]
 
+    # THE BIG LAG FIX: many TVs (including older Sonys) wait until they've collected a
+    # fixed AMOUNT OF DATA before they start playing. A normal encoder makes almost no
+    # data for a still screen (~60 kbit/s instead of 8,000), so the TV waits a very long
+    # time - that's where a 20-40 second delay comes from. So we make the video and the
+    # sound constant-size: the encoder tops every frame up with "filler" the TV throws
+    # away, and the TV's buffer fills in a fraction of a second.
+    kbps = int(args.rate * 1000)
     if args.encoder == "hardware":
+        # Apple's hardware encoder can't add filler, so still screens will lag more.
         cmd += ["-c:v", "h264_videotoolbox", "-realtime", "1", "-allow_sw", "1",
-                "-profile:v", "high"]
+                "-profile:v", "high",
+                "-b:v", f"{kbps}k", "-maxrate", f"{kbps}k", "-bufsize", f"{kbps}k"]
     else:
         cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-                "-profile:v", "high"]
+                "-profile:v", "high",
+                "-b:v", f"{kbps}k", "-minrate", f"{kbps}k", "-maxrate", f"{kbps}k",
+                "-bufsize", f"{max(kbps // 2, 500)}k",
+                "-x264-params", "nal-hrd=cbr:force-cfr=1"]   # constant bitrate + filler
     cmd += [
-        "-b:v", args.bitrate, "-maxrate", args.bitrate, "-bufsize", args.bitrate,
         "-g", str(args.fps),              # a keyframe every second -> fast start
         "-bsf:v", "dump_extra",           # repeat picture settings so a TV can join any time
-        "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+        # AC-3 sound always uses the same number of bytes, even for silence
+        # (AAC shrinks silence to ~5 kbit/s, which also makes TVs wait).
+        "-c:a", "ac3", "-b:a", "448k", "-ar", "48000", "-ac", "2",
         "-f", "mpegts", "-mpegts_flags", "+pat_pmt_at_frames",
     ]
     if args.boost:
-        # Lag fix: TVs fill a fixed-size buffer (in bytes) before they start playing.
-        # Padding the stream with empty "filler" packets fills it faster, so the TV
-        # holds fewer seconds of video -> less delay. The TV throws the filler away.
-        cmd += ["-muxrate", f"{args.boost}M"]
+        # Optional extra: also pad the whole stream with empty packets up to this rate.
+        # Only helps TVs that count the raw network data; costs Wi-Fi bandwidth.
+        cmd += ["-muxrate", f"{max(args.boost, args.rate + 1)}M"]
     cmd += [
         "-muxdelay", "0", "-flush_packets", "1",
         "pipe:1",
@@ -298,10 +314,13 @@ class Broadcaster:
         self.lock = threading.Lock()
         self.clients = set()
         self.running = True
+        self.max_backlog = 1024 * 1024   # bytes a TV may fall behind before we skip ahead
+        self.drops = 0                   # how many times a TV fell too far behind
 
     def subscribe(self):
-        q = queue.Queue(maxsize=150)
+        q = queue.Queue()
         q.waiting_for_keyframe = True
+        q.backlog = 0
         with self.lock:
             self.clients.add(q)
         return q
@@ -340,12 +359,18 @@ class Broadcaster:
                     continue  # new viewer: wait for the next clean frame
                 q.waiting_for_keyframe = False
                 data = chunk[start:]
-            try:
-                q.put_nowait(data)
-            except queue.Full:
-                # The TV fell behind: skip ahead to keep the delay low.
+            if q.backlog + len(data) > self.max_backlog:
+                # The TV can't take the video as fast as we make it (Wi-Fi too slow).
+                # Rather than let a delay build up here, skip ahead and restart
+                # cleanly at the next full frame.
                 with q.mutex:
                     q.queue.clear()
+                q.backlog = 0
+                q.waiting_for_keyframe = True
+                self.drops += 1
+                continue
+            q.backlog += len(data)
+            q.put_nowait(data)
 
     def close(self):
         self.running = False
@@ -399,12 +424,18 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
     server_version = "TVMirror/1.0"
     protocol_version = "HTTP/1.1"
     mode = "sony"         # "sony": pretend it's a huge file (old Sony TVs need this)
-    debug = False         # "stream": plain endless stream
+                          # "live": endless stream marked as a live broadcast (DLNA
+                          #         "sender paced"), so the TV may keep a smaller buffer
+                          # "stream": plain endless stream
+    debug = False
     dlna_pn = ""
     FAKE_LENGTH = 100 * 1024 ** 3   # 100 GB, i.e. "a very long video"
 
     def _features(self):
         pn = f"DLNA.ORG_PN={self.dlna_pn};" if self.dlna_pn else ""
+        if self.mode == "live":
+            # sender-paced + start/end keep moving + streaming transfer + DLNA 1.5
+            return pn + "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=8D100000000000000000000000000000"
         op = "DLNA.ORG_OP=01;" if self.mode == "sony" else "DLNA.ORG_OP=00;"
         return pn + op + "DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 
@@ -414,9 +445,10 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
             print(f"  [debug] {self.command} {self.path} | {hdrs}")
 
     def _send_headers(self):
-        """Send headers; returns how many bytes the TV was told to expect (or None)."""
+        """Send headers. Returns (ok, byte limit or None, chunked?)."""
         rng = self.headers.get("Range", "")
         m = re.match(r"bytes=(\d*)-(\d*)", rng)
+        length, chunked = None, False
         if self.mode == "sony":
             start = int(m.group(1)) if m and m.group(1) else 0
             start = min(start, self.FAKE_LENGTH - 1)
@@ -431,8 +463,22 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
                 self.send_response(200)
             self.send_header("Content-Length", str(length))
             self.send_header("Accept-Ranges", "bytes")
+        elif self.mode == "live":
+            if m and m.group(1) and int(m.group(1)) > 0:
+                # A live broadcast can't jump around
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */*")
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                return False, None, False
+            self.send_response(200)
+            self.send_header("realTimeInfo.dlna.org", "DLNA.ORG_TLAG=*")
+            if self.request_version == "HTTP/1.1":
+                self.send_header("Transfer-Encoding", "chunked")
+                chunked = True
         else:
-            length = None
             self.send_response(200)
         self.send_header("Content-Type", MIME)
         self.send_header("transferMode.dlna.org", "Streaming")
@@ -441,7 +487,7 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
-        return length
+        return True, length, chunked
 
     def _valid_path(self):
         return urllib.parse.urlparse(self.path).path == STREAM_PATH
@@ -458,8 +504,11 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
         if not self._valid_path():
             self.send_error(404)
             return
-        limit = self._send_headers()
+        ok, limit, chunked = self._send_headers()
+        if not ok:
+            return
         try:
+            # Small send buffer, so video can't pile up unseen inside macOS
             self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
         except OSError:
             pass
@@ -472,9 +521,13 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
                 if chunk is None:
                     reason = "stream ended"
                     break
+                q.backlog = max(0, q.backlog - len(chunk))
                 if limit is not None and sent + len(chunk) > limit:
                     chunk = chunk[:limit - sent]
-                self.wfile.write(chunk)
+                if chunked:
+                    self.wfile.write(b"%X\r\n" % len(chunk) + chunk + b"\r\n")
+                else:
+                    self.wfile.write(chunk)
                 sent += len(chunk)
                 if limit is not None and sent >= limit:
                     reason = "sent everything the TV asked for"
@@ -830,14 +883,47 @@ def choose_screen(wanted):
             return screens[int(choice) - 1]
 
 
+def self_update():
+    """Replace this file with the newest tvmirror.py from GitHub."""
+    me = os.path.abspath(__file__)
+    try:
+        # Ask GitHub for the newest version's ID first: the plain download link can
+        # serve an old copy for a few minutes after an update.
+        info = subprocess.run(["curl", "-fsSL", f"https://api.github.com/repos/{REPO}/commits/main"],
+                              capture_output=True, text=True, timeout=20)
+        sha = json.loads(info.stdout)["sha"]
+        new = subprocess.run(["curl", "-fsSL",
+                              f"https://raw.githubusercontent.com/{REPO}/{sha}/tvmirror.py"],
+                             capture_output=True, timeout=60).stdout
+    except Exception as e:
+        print(f"Couldn't download the update ({e}). Check your internet connection.")
+        return 1
+    if b"def main()" not in new:
+        print("The download didn't look right, so nothing was changed.")
+        return 1
+    with open(me, "rb") as f:
+        if f.read() == new:
+            print(f"You already have the newest version ({VERSION}).")
+            return 0
+    tmp = me + ".new"
+    with open(tmp, "wb") as f:
+        f.write(new)
+    os.replace(tmp, me)
+    m = re.search(rb'VERSION = "([^"]+)"', new)
+    print(f"Updated TV Mirror {VERSION} -> {m.group(1).decode() if m else 'newest'}.")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description="Mirror your Mac's screen to a smart TV.")
     p.add_argument("--tv", help="TV name (or part of it) or IP address")
     p.add_argument("--screen", help="which screen to mirror: 1, 2, ... (default: asks if you have more than one)")
-    p.add_argument("--boost", default="25M",
-                   help="lag reducer: pads the stream to this rate (e.g. 25M) so the TV holds "
-                        "fewer seconds of video. Higher = less lag but needs better Wi-Fi. "
-                        "0 turns it off. Change it live with + and -")
+    p.add_argument("--rate", type=float, default=8,
+                   help="stream size in Mbit/s, kept constant so the TV starts quickly. "
+                        "Higher = less delay but needs better Wi-Fi (default 8). "
+                        "Change it live with + and -")
+    p.add_argument("--boost", default="0",
+                   help="extra: also pad the whole stream to this rate, e.g. 20M (default off)")
     p.add_argument("--virtual-display", action="store_true",
                    help="add an invisible extra screen and mirror that, so you can keep "
                         "working on your other desktops")
@@ -850,20 +936,27 @@ def main():
     p.add_argument("--audio-device", help='audio input to send, e.g. "BlackHole 2ch" (default: silent)')
     p.add_argument("--fps", type=int, default=30, help="frames per second (default 30)")
     p.add_argument("--height", type=int, default=1080, help="video height, e.g. 720 or 1080 (default 1080)")
-    p.add_argument("--bitrate", default="8M", help="video bitrate (default 8M)")
-    p.add_argument("--encoder", choices=["hardware", "software"], default="hardware",
-                   help="hardware (fast, default) or software (try if the TV shows errors)")
+    p.add_argument("--encoder", choices=["software", "hardware"], default="software",
+                   help="software (default: constant size, least delay) or hardware "
+                        "(less CPU, but still screens lag more)")
     p.add_argument("--port", type=int, default=8090, help="port for the stream (default 8090)")
-    p.add_argument("--mode", choices=["sony", "stream"], default="sony",
-                   help="how the video is served: sony (default, for older Sony TVs) or stream")
+    p.add_argument("--mode", choices=["sony", "live", "stream"], default="sony",
+                   help="how the video is served: sony (default, looks like a long video file), "
+                        "live (marked as a live broadcast) or stream. Switch live with M")
     p.add_argument("--dlna-profile", default="",
                    help="DLNA profile name to announce, e.g. AVC_TS_HD_EU_ISO (default: none)")
     p.add_argument("--debug", action="store_true", help="print what the TV asks for")
     p.add_argument("--search-time", type=float, default=4.0, help="seconds to search for TVs")
+    p.add_argument("--update", action="store_true", help="download the newest version from GitHub")
+    p.add_argument("--version", action="version", version=f"TV Mirror {VERSION}")
     p.add_argument("--list-devices", action="store_true", help="list screens and audio devices, then exit")
     p.add_argument("--serve-only", action="store_true", help="don't control a TV; just serve the stream")
     p.add_argument("--test-pattern", action="store_true", help="send a test picture instead of your screen")
     args = p.parse_args()
+
+    if args.update:
+        sys.exit(self_update())
+    print(f"TV Mirror {VERSION}")
 
     StreamHandler.mode = args.mode
     StreamHandler.debug = args.debug
@@ -877,6 +970,13 @@ def main():
     filters = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
                              capture_output=True, text=True).stdout
     HAS_DRAWTEXT = re.search(r"\sdrawtext\s", filters) is not None
+    if args.encoder == "software":
+        encoders = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                                  capture_output=True, text=True).stdout
+        if "libx264" not in encoders:
+            print("Note: this ffmpeg has no libx264, so using the hardware encoder.\n"
+                  "Still screens will have more delay. Fix: brew reinstall ffmpeg")
+            args.encoder = "hardware"
     terminal_clock = args.show_clock and not HAS_DRAWTEXT
 
     if args.list_devices:
@@ -908,7 +1008,8 @@ def main():
     try:
         args.boost = int(float(str(args.boost).upper().rstrip("M") or 0))
     except ValueError:
-        args.boost = 25
+        args.boost = 0
+    args.rate = max(1.0, min(args.rate, 40.0))
     screens = [] if args.test_pattern else list_devices()[0]
 
     # Start the little web server the TV will read from
@@ -918,6 +1019,9 @@ def main():
     capture = {"proc": None}
 
     def start_capture():
+        # Let a TV fall at most ~0.75 s behind before skipping ahead
+        rate = max(args.rate, args.boost or 0) + 0.5
+        BROADCASTER.max_backlog = int(max(rate * 1e6 / 8 * 0.75, 256 * 1024))
         proc = subprocess.Popen(ffmpeg_command(args), stdout=subprocess.PIPE,
                                 stdin=subprocess.DEVNULL)
         threading.Thread(target=BROADCASTER.pump, args=(proc.stdout,), daemon=True).start()
@@ -957,14 +1061,13 @@ def main():
             what = f"screen {int(args.screen.split()[-1]) + 1}"
         if vd_screen and args.screen == vd_screen:
             what += " (TV Mirror Display)"
-        boost = f"{args.boost}M" if args.boost else "off"
-        log(f"  Now showing: {what}  |  lag reducer: {boost}")
+        log(f"  Now showing: {what}  |  stream: {args.rate:g} Mbit/s constant  |  mode: {StreamHandler.mode}")
 
     if not start_capture():
         print("\nScreen capture failed to start. If you see a permission error above:\n"
               "  System Settings > Privacy & Security > Screen Recording > turn ON Terminal\n"
-              "  (then quit and reopen Terminal). If the error mentions videotoolbox,\n"
-              "  try again with:  --encoder software")
+              "  (then quit and reopen Terminal). If the error mentions libx264,\n"
+              "  try again with:  --encoder hardware")
         server.shutdown()
         sys.exit(1)
 
@@ -974,7 +1077,7 @@ def main():
         try:
             play_on_tv()
         except Exception as e:
-            print(f"\n{e}\nThe TV didn't accept the stream. Try:  --encoder software --height 720")
+            print(f"\n{e}\nThe TV didn't accept the stream. Try:  --mode live   or   --height 720")
             stop_capture()
             server.shutdown()
             sys.exit(1)
@@ -990,12 +1093,14 @@ def main():
     if len(screens) > 1:
         print(f"  1-{min(len(screens), 9)}  switch to that screen")
     print("  R    reset the delay (TV restarts from 'now'; do this if it falls behind)\n"
-          "  +/-  more / less lag reduction (more = less delay, needs better Wi-Fi)\n"
+          "  +/-  bigger / smaller stream (bigger = less delay, needs better Wi-Fi)\n"
+          "  M    switch how the TV is told about the video (sony / live), to compare\n"
           "  Q    quit")
     status()
 
     keys = KeyReader()
     last_reset = time.time()
+    warned_drops, last_warning = 0, 0.0
     try:
         with keys:
             while True:
@@ -1003,6 +1108,10 @@ def main():
                     log("\nScreen capture stopped unexpectedly.")
                     break
                 key = keys.read(0.25)
+                if BROADCASTER.drops > warned_drops and time.time() - last_warning > 10:
+                    warned_drops, last_warning = BROADCASTER.drops, time.time()
+                    log(f"  ! The TV can't keep up with {args.rate:g} Mbit/s over your Wi-Fi, "
+                        "so some video was skipped. Press - for a smaller stream.")
                 if terminal_clock:
                     sys.stdout.write("\r\033[K  Mac clock: " + time.strftime("%H:%M:%S") +
                                      "   <- compare with the same clock on the TV")
@@ -1020,20 +1129,32 @@ def main():
                     log("  Resetting the delay..." if not auto else "  Auto-reset of the delay...")
                     reset_lag()
                     last_reset = time.time()
+                    warned_drops = BROADCASTER.drops   # forget older warnings
                 elif key in "+=-_":
-                    old = args.boost
+                    old = args.rate
                     if key in "+=":
-                        args.boost = max(args.boost + 5, 15)
+                        args.rate = next((r for r in RATE_STEPS if r > old), old)
                     else:
-                        args.boost = args.boost - 5 if args.boost > 15 else 0
-                    if args.boost == old:
+                        args.rate = next((r for r in reversed(RATE_STEPS) if r < old), old)
+                    if args.rate == old:
+                        log(f"  Already at the {'highest' if key in '+=' else 'lowest'} setting.")
                         continue
-                    log("  Changing lag reducer...")
+                    log(f"  Changing the stream to {args.rate:g} Mbit/s...")
                     if not reset_lag(restart_video=True):
                         log("  That setting didn't work; going back.")
-                        args.boost = old
+                        args.rate = old
                         reset_lag(restart_video=True)
                     last_reset = time.time()
+                    warned_drops = BROADCASTER.drops   # forget older warnings
+                    status()
+                elif key == "m":
+                    order = ["sony", "live"]
+                    cur = StreamHandler.mode
+                    StreamHandler.mode = order[(order.index(cur) + 1) % 2] if cur in order else "sony"
+                    log(f"  Switching to {StreamHandler.mode} mode...")
+                    reset_lag()
+                    last_reset = time.time()
+                    warned_drops = BROADCASTER.drops   # forget older warnings
                     status()
                 elif key.isdigit() and screens:
                     n = int(key)
@@ -1050,6 +1171,7 @@ def main():
                         args.screen = old
                         reset_lag(restart_video=True)
                     last_reset = time.time()
+                    warned_drops = BROADCASTER.drops   # forget older warnings
                     status()
     except KeyboardInterrupt:
         pass
