@@ -43,7 +43,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 APP_NAME = "TV Mirror"
-VERSION = "1.6"
+VERSION = "1.7"
 REPO = "nizarhalim05/tv-mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -65,11 +65,13 @@ AUDIO_CODECS = {
 # Combinations tried in order if the TV says it can't play the stream.
 # The last one is the one older Sony TVs are known to play (but with more delay).
 PROFILES = [
-    ("software", "mp2", "constant-size video + MP2 sound"),
-    ("software", "aac", "constant-size video + AAC sound"),
-    ("hardware", "aac", "Mac's video chip + AAC sound (plays on more TVs, more delay)"),
+    ("software", "mp2", "steady video + MP2 sound"),
+    ("software", "aac", "steady video + AAC sound"),
+    ("intra", "aac", "Mac's video chip, every frame complete + AAC sound"),
+    ("hardware", "aac", "Mac's video chip + AAC sound (plays on most TVs, but more delay)"),
 ]
 RATE_STEPS = [2, 3, 4, 6, 8, 10, 12, 15, 20, 25, 30]   # Mbit/s choices for + and -
+HAS_X264 = True        # set at startup: does this ffmpeg have the libx264 encoder?
 HAS_DRAWTEXT = False   # set at startup: can this ffmpeg draw text on the video?
 VIDEO_PID = 0x100   # ffmpeg's default IDs for the first track and the stream map
 PMT_PID = 0x1000
@@ -238,28 +240,34 @@ def tv_state(tv):
             status.group(1).strip().upper() if status else None)
 
 
-def tv_check(tv, wait=15, debug=False):
-    """After pressing play: 'playing', 'failed' (the TV gave up) or 'unknown'."""
-    seen_playing, stopped_count = False, 0
-    end = time.time() + wait
-    time.sleep(2)
-    while time.time() < end:
-        state, status = tv_state(tv)
-        if debug:
-            print(f"  [debug] TV state: {state} / {status}")
-        if state is None:
-            return "unknown"          # this TV doesn't answer the question
-        if status == "ERROR_OCCURRED":
-            return "failed"
-        if state == "PLAYING":
-            seen_playing = True
-            stopped_count = 0
-        elif state in ("STOPPED", "NO_MEDIA_PRESENT"):
-            stopped_count += 1
-            if stopped_count >= 3:    # stopped by itself for ~3 s: it gave up
+def tv_check(tv, wait=25, debug=False):
+    """After pressing play, see whether the TV really plays the stream: 'playing' or 'failed'.
+
+    The TV's own answer can't be trusted (some say PLAYING while showing an error),
+    so we watch what it downloads instead. A TV that's playing keeps up with the
+    live stream; a TV that rejects it only grabs small pieces and hangs up.
+    """
+    samples, start, last_ask = [], time.time(), 0.0
+    while time.time() - start < wait:
+        time.sleep(0.5)
+        now = time.time()
+        samples.append((now, BROADCASTER.produced, StreamHandler.delivered))
+        old = [x for x in samples if now - x[0] >= 6]
+        if old:
+            t0, p0, d0 = old[-1]
+            made, sent = BROADCASTER.produced - p0, StreamHandler.delivered - d0
+            if debug and int(now - start) % 3 == 0 and now - start - int(now - start) < 0.5:
+                print(f"  [debug] last 6 s: made {made // 1024} KB, TV took {sent // 1024} KB")
+            if made > 100 * 1024 and sent >= 0.6 * made:
+                return "playing"
+        if now - last_ask > 2:
+            last_ask = now
+            state, status = tv_state(tv)
+            if debug:
+                print(f"  [debug] TV says: {state} / {status}")
+            if status == "ERROR_OCCURRED":
                 return "failed"
-        time.sleep(1)
-    return "playing" if seen_playing else "unknown"
+    return "failed"
 
 
 def tv_stop(tv):
@@ -328,19 +336,25 @@ def ffmpeg_command(args):
     # sound constant-size: the encoder tops every frame up with "filler" the TV throws
     # away, and the TV's buffer fills in a fraction of a second.
     kbps = int(args.rate * 1000)
-    if args.encoder == "hardware":
-        # Apple's hardware encoder can't add filler, so still screens will lag more.
+    gop = args.fps                        # a keyframe every second -> fast start
+    if args.encoder in ("hardware", "intra"):
+        # Apple's hardware encoder can't add filler. "intra" makes every frame a
+        # complete picture instead, which also keeps the amount of data up.
         cmd += ["-c:v", "h264_videotoolbox", "-realtime", "1", "-allow_sw", "1",
                 "-profile:v", "high",
                 "-b:v", f"{kbps}k", "-maxrate", f"{kbps}k", "-bufsize", f"{kbps}k"]
+        if args.encoder == "intra":
+            gop = 1
     else:
-        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        # "superfast", not "ultrafast": ultrafast silently drops to the Baseline
+        # profile, which many TVs refuse for HD video.
+        cmd += ["-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency",
                 "-profile:v", "high",
                 "-b:v", f"{kbps}k", "-minrate", f"{kbps}k", "-maxrate", f"{kbps}k",
                 "-bufsize", f"{max(kbps // 2, 500)}k",
                 "-x264-params", "nal-hrd=cbr:force-cfr=1"]   # constant bitrate + filler
     cmd += [
-        "-g", str(args.fps),              # a keyframe every second -> fast start
+        "-g", str(gop),
         "-bsf:v", "dump_extra",           # repeat picture settings so a TV can join any time
     ] + AUDIO_CODECS[args.audio_codec] + [
         "-ar", "48000", "-ac", "2",
@@ -368,6 +382,7 @@ class Broadcaster:
         self.running = True
         self.max_backlog = 1024 * 1024   # bytes a TV may fall behind before we skip ahead
         self.drops = 0                   # how many times a TV fell too far behind
+        self.produced = 0                # bytes of video made so far
 
     def subscribe(self):
         q = queue.Queue()
@@ -399,6 +414,7 @@ class Broadcaster:
         return -1
 
     def publish(self, chunk):
+        self.produced += len(chunk)
         with self.lock:
             clients = list(self.clients)
         start = None
@@ -481,6 +497,7 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
                           # "stream": plain endless stream
     debug = False
     dlna_pn = ""
+    delivered = 0         # bytes sent to TVs so far (to see if a TV is really playing)
     FAKE_LENGTH = 100 * 1024 ** 3   # 100 GB, i.e. "a very long video"
 
     def _features(self):
@@ -581,6 +598,7 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     self.wfile.write(chunk)
                 sent += len(chunk)
+                StreamHandler.delivered += len(chunk)
                 if limit is not None and sent >= limit:
                     reason = "sent everything the TV asked for"
                     break
@@ -769,6 +787,32 @@ int main(int argc, const char *argv[]) {
     return 0;
 }
 '''
+
+
+MEMORY_FILE = os.path.join(os.path.expanduser("~"), ".tv-mirror-build", "tvs.json")
+
+
+def remembered_format(tv_name):
+    try:
+        with open(MEMORY_FILE) as f:
+            entry = json.load(f).get(tv_name) or {}
+        return entry.get("encoder"), entry.get("audio")
+    except Exception:
+        return None, None
+
+
+def remember_format(tv_name, encoder, audio):
+    try:
+        os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
+        data = {}
+        if os.path.exists(MEMORY_FILE):
+            with open(MEMORY_FILE) as f:
+                data = json.load(f)
+        data[tv_name] = {"encoder": encoder, "audio": audio}
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
 
 
 def build_vdisplay():
@@ -995,7 +1039,7 @@ def main():
     p.add_argument("--height", type=int, default=1080, help="video height, e.g. 720 or 1080 (default 1080)")
     p.add_argument("--audio-codec", choices=["mp2", "ac3", "aac"], default=None,
                    help="sound format (default mp2; tries others if the TV refuses)")
-    p.add_argument("--encoder", choices=["software", "hardware"], default=None,
+    p.add_argument("--encoder", choices=["software", "intra", "hardware"], default=None,
                    help="software (default: constant size, least delay) or hardware "
                         "(less CPU, but still screens lag more). Tries others if the TV refuses")
     p.add_argument("--port", type=int, default=8090, help="port for the stream (default 8090)")
@@ -1025,17 +1069,17 @@ def main():
         print("ffmpeg is not installed. Install it with:  brew install ffmpeg")
         sys.exit(1)
 
-    global HAS_DRAWTEXT
+    global HAS_DRAWTEXT, HAS_X264
     filters = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
                              capture_output=True, text=True).stdout
     HAS_DRAWTEXT = re.search(r"\sdrawtext\s", filters) is not None
     if args.encoder != "hardware":
         encoders = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
                                   capture_output=True, text=True).stdout
-        if "libx264" not in encoders:
-            print("Note: this ffmpeg has no libx264, so using the hardware encoder.\n"
+        HAS_X264 = "libx264" in encoders
+        if not HAS_X264:
+            print("Note: this ffmpeg has no libx264, so using the Mac's video chip.\n"
                   "Still screens will have more delay. Fix: brew reinstall ffmpeg")
-            args.encoder = "hardware"
     terminal_clock = args.show_clock and not HAS_DRAWTEXT
 
     if args.list_devices:
@@ -1077,13 +1121,19 @@ def main():
 
     capture = {"proc": None}
 
-    # Formats to try, starting with what was asked for
-    wanted = (args.encoder or "software", args.audio_codec or "mp2")
-    profiles = [p for p in PROFILES if (p[0], p[1]) == wanted] or \
-               [(wanted[0], wanted[1], f"{wanted[0]} video + {wanted[1].upper()} sound")]
-    profiles += [p for p in PROFILES if p not in profiles]
-    if args.encoder == "hardware":     # asked for: don't switch to software later
-        profiles = [p for p in profiles if p[0] == "hardware"] or profiles
+    # Formats to try: what was asked for, else what worked on this TV last time,
+    # else the order in PROFILES (least delay first).
+    available = [p for p in PROFILES if p[0] != "software" or HAS_X264]
+    if args.encoder or args.audio_codec:
+        want = (args.encoder or available[0][0], args.audio_codec or "mp2")
+        first = [p for p in available if (p[0], p[1]) == want] or \
+                [(want[0], want[1], f"{want[0]} video + {want[1].upper()} sound")]
+    else:
+        last_time = remembered_format(tv["name"]) if tv else (None, None)
+        first = [p for p in available if (p[0], p[1]) == last_time]
+        if first:
+            print(f"Using the format that worked on this TV last time: {first[0][2]}")
+    profiles = first + [p for p in available if p not in first]
     args.encoder, args.audio_codec = profiles[0][0], profiles[0][1]
 
     def start_capture():
@@ -1129,9 +1179,9 @@ def main():
             what = f"screen {int(args.screen.split()[-1]) + 1}"
         if vd_screen and args.screen == vd_screen:
             what += " (TV Mirror Display)"
-        kind = "constant" if args.encoder == "software" else "varying"
-        log(f"  Now showing: {what}  |  stream: {args.rate:g} Mbit/s {kind}, "
-            f"{args.audio_codec.upper()} sound  |  mode: {StreamHandler.mode}")
+        label = next((p[2] for p in PROFILES if (p[0], p[1]) == (args.encoder, args.audio_codec)),
+                     f"{args.encoder} video + {args.audio_codec.upper()} sound")
+        log(f"  Now showing: {what}  |  {args.rate:g} Mbit/s  |  {label}  |  mode: {StreamHandler.mode}")
 
     if not start_capture():
         print("\nScreen capture failed to start. If you see a permission error above:\n"
@@ -1157,15 +1207,13 @@ def main():
             except Exception as e:
                 print(f"  The TV refused: {e}")
                 continue
+            if i == len(profiles) - 1:
+                break                     # last option: nothing else to fall back to
             print(f"Checking the TV can play it ({label})...")
-            result = tv_check(tv, debug=args.debug)
-            if result != "failed":
+            if tv_check(tv, debug=args.debug) == "playing":
+                print("The TV is playing it.")
+                remember_format(tv["name"], encoder, audio_codec)
                 break
-        else:
-            print("\nThe TV couldn't play any of the formats. Try:  --mode live   or   --height 720")
-            stop_capture()
-            server.shutdown()
-            sys.exit(1)
         print("Mirroring! It can take a few seconds to appear.")
     else:
         print("Serve-only mode: open the URL above in VLC (File > Open Network).")
@@ -1179,6 +1227,7 @@ def main():
         print(f"  1-{min(len(screens), 9)}  switch to that screen")
     print("  R    reset the delay (TV restarts from 'now'; do this if it falls behind)\n"
           "  +/-  bigger / smaller stream (bigger = less delay, needs better Wi-Fi)\n"
+          "  F    try the next video format (if the TV shows an error)\n"
           "  M    switch how the TV is told about the video (sony / live), to compare\n"
           "  Q    quit")
     status()
@@ -1231,6 +1280,18 @@ def main():
                         reset_lag(restart_video=True)
                     last_reset = time.time()
                     warned_drops = BROADCASTER.drops   # forget older warnings
+                    status()
+                elif key == "f":
+                    keys_ = [(p[0], p[1]) for p in profiles]
+                    i = keys_.index((args.encoder, args.audio_codec)) if (args.encoder, args.audio_codec) in keys_ else -1
+                    for step in range(1, len(profiles) + 1):
+                        args.encoder, args.audio_codec, label = profiles[(i + step) % len(profiles)]
+                        log(f"  Switching format to: {label}...")
+                        if reset_lag(restart_video=True):
+                            break
+                        log("  That format didn't start on this Mac; trying the next one.")
+                    last_reset = time.time()
+                    warned_drops = BROADCASTER.drops
                     status()
                 elif key == "m":
                     order = ["sony", "live"]

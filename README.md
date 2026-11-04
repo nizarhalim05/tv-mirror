@@ -70,6 +70,7 @@ Click the TV Mirror (Terminal) window, then press:
 | **1**, **2**, **3**... | Switch to that screen |
 | **R** | Reset the delay: the TV starts again from "now" |
 | **+** / **-** | Bigger / smaller stream (bigger = less delay, needs better Wi-Fi) |
+| **F** | Try the next video format (if the TV shows an error like "Playback not available") |
 | **M** | Switch between "sony" and "live" mode, to see which has less delay on your TV |
 | **Q** | Quit |
 
@@ -93,7 +94,7 @@ Run these in Terminal, inside the `~/tv-mirror` folder (`cd ~/tv-mirror`):
 | `python3 tvmirror.py --tv "Bravia"` | Pick a TV by name or IP address if you have several |
 | `python3 tvmirror.py --height 720` | Lower quality, smoother on weak Wi-Fi |
 | `python3 tvmirror.py --mode live` | Tell the TV it's a live broadcast instead of a long video file |
-| `python3 tvmirror.py --encoder hardware` | Use the Mac's video chip: less CPU, but more delay on still screens |
+| `python3 tvmirror.py --encoder hardware` | Use the Mac's video chip: less CPU, but more delay on still screens (`intra` = every frame complete) |
 | `python3 tvmirror.py --audio-codec aac` | Sound format: `mp2` (default), `ac3` or `aac` |
 | `python3 tvmirror.py --mode stream` | For newer TVs that don't like the default Sony mode |
 | `python3 tvmirror.py --debug` | Show what the TV is asking for (for troubleshooting) |
@@ -145,10 +146,10 @@ the TV gets the picture with silence. To send sound too:
 
 ## Troubleshooting
 
-- **The TV says "Playback not available"**: TV Mirror asks the TV whether it's
-  playing and, if not, automatically tries other formats, ending with one older
-  Sony TVs are known to play. If it still fails, try `--mode live`, or
-  `--audio-codec aac`, or `--encoder hardware`.
+- **The TV says "Playback not available"**: when it starts, TV Mirror watches
+  whether the TV really downloads the video and, if not, automatically tries
+  other formats, ending with one older Sony TVs are known to play. It remembers
+  what worked for your TV. You can also press **F** to switch format by hand.
 
 - **"No TV found"**: the TV and Mac must be on the same network. Guest Wi-Fi
   and some mesh routers block devices from seeing each other. On the TV, check
