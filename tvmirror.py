@@ -43,7 +43,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 APP_NAME = "TV Mirror"
-VERSION = "1.7"
+VERSION = "1.8"
 REPO = "nizarhalim05/tv-mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -640,8 +640,12 @@ VDISPLAY_SOURCE = r'''// vdisplay - creates an invisible extra screen ("virtual 
 // (no Dock icon, no windows). The screen exists for as long as this
 // program runs; when it quits, the screen disappears and its windows move back.
 //
+// macOS doesn't always switch a new virtual screen on (for example right after the
+// previous one was removed), so this waits until it's really on, and otherwise
+// removes it and tries again as a "new" monitor, up to 4 times.
+//
 // Build:  clang -fobjc-arc -framework AppKit -framework Foundation -framework CoreGraphics vdisplay.m -o vdisplay
-// Run:    ./vdisplay 1920 1080        (prints the new screen's display ID)
+// Run:    ./vdisplay 1920 1080        (prints the new screen's display ID once it's on)
 
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
@@ -686,36 +690,77 @@ VDISPLAY_SOURCE = r'''// vdisplay - creates an invisible extra screen ("virtual 
 static void quit(int sig) { (void)sig; exit(0); }
 
 static CGVirtualDisplay *gDisplay;   // kept for as long as the program runs
+static unsigned int gWidth = 1920, gHeight = 1080;
+static int gAttempt = 0;
+static BOOL gReplacing = NO;         // YES while we remove a screen on purpose
+static const int kMaxAttempts = 4;
 
-static void reportAndFix(CGDirectDisplayID newID) {
-    // macOS sometimes adds a new screen as a *mirror* of the main one.
-    // A mirror isn't a separate screen, so switch that off.
-    if (CGDisplayIsInMirrorSet(newID)) {
-        CGDisplayConfigRef config;
-        if (CGBeginDisplayConfiguration(&config) == kCGErrorSuccess) {
-            CGConfigureDisplayMirrorOfDisplay(config, newID, kCGNullDirectDisplay);
-            CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
-        }
-    }
-    // Report how macOS sees the new screen (for troubleshooting).
+static void createDisplay(void);
+
+static BOOL isOnline(CGDirectDisplayID displayID) {
+    CGDirectDisplayID online[16];
+    uint32_t count = 0;
+    CGGetOnlineDisplayList(16, online, &count);
+    for (uint32_t i = 0; i < count; i++) if (online[i] == displayID) return YES;
+    return NO;
+}
+
+static void report(CGDirectDisplayID newID) {
     CGDirectDisplayID online[16], active[16];
     uint32_t nOnline = 0, nActive = 0;
     CGGetOnlineDisplayList(16, online, &nOnline);
     CGGetActiveDisplayList(16, active, &nActive);
-    int isOnline = 0, isActive = 0;
-    for (uint32_t i = 0; i < nOnline; i++) if (online[i] == newID) isOnline = 1;
+    int isActive = 0;
     for (uint32_t i = 0; i < nActive; i++) if (active[i] == newID) isActive = 1;
     CGRect b = CGDisplayBounds(newID);
     fprintf(stderr,
-            "[vdisplay] id=%u online=%d active=%d mirrored=%d asleep=%d size=%.0fx%.0f at %.0f,%.0f "
+            "[vdisplay] try %d: id=%u online=%d active=%d mirrored=%d asleep=%d size=%.0fx%.0f at %.0f,%.0f "
             "| online screens=%u active screens=%u\n",
-            newID, isOnline, isActive, (int)CGDisplayIsInMirrorSet(newID),
+            gAttempt, newID, (int)isOnline(newID), isActive, (int)CGDisplayIsInMirrorSet(newID),
             (int)CGDisplayIsAsleep(newID), b.size.width, b.size.height, b.origin.x, b.origin.y,
             nOnline, nActive);
     fflush(stderr);
 }
 
-static void createDisplay(unsigned int width, unsigned int height) {
+// Check every 0.25 s whether macOS has switched the screen on.
+static void waitUntilOnline(CGDirectDisplayID newID, int checks) {
+    if (isOnline(newID)) {
+        // macOS sometimes adds a new screen as a *mirror* of the main one.
+        // A mirror isn't a separate screen, so switch that off.
+        if (CGDisplayIsInMirrorSet(newID)) {
+            CGDisplayConfigRef config;
+            if (CGBeginDisplayConfiguration(&config) == kCGErrorSuccess) {
+                CGConfigureDisplayMirrorOfDisplay(config, newID, kCGNullDirectDisplay);
+                CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
+            }
+        }
+        report(newID);
+        printf("%u\n", newID);       // tell TV Mirror the screen is ready
+        fflush(stdout);
+        return;
+    }
+    if (checks < 12) {               // keep waiting, up to 3 seconds
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 4), dispatch_get_main_queue(), ^{
+            waitUntilOnline(newID, checks + 1);
+        });
+        return;
+    }
+    report(newID);
+    if (gAttempt >= kMaxAttempts) {
+        fprintf(stderr, "macOS didn't switch the virtual screen on after %d tries.\n", gAttempt);
+        exit(5);
+    }
+    // Remove it and try again as a "new" monitor
+    gReplacing = YES;
+    gDisplay = nil;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC / 2), dispatch_get_main_queue(), ^{
+        gReplacing = NO;
+        createDisplay();
+    });
+}
+
+static void createDisplay(void) {
+    gAttempt++;
     Class Descriptor = NSClassFromString(@"CGVirtualDisplayDescriptor");
     Class Display    = NSClassFromString(@"CGVirtualDisplay");
     Class Settings   = NSClassFromString(@"CGVirtualDisplaySettings");
@@ -728,13 +773,14 @@ static void createDisplay(unsigned int width, unsigned int height) {
     CGVirtualDisplayDescriptor *descriptor = [[Descriptor alloc] init];
     [descriptor setDispatchQueue:dispatch_get_main_queue()];
     descriptor.name = @"TV Mirror Display";
-    descriptor.maxPixelsWide = width;
-    descriptor.maxPixelsHigh = height;
-    descriptor.sizeInMillimeters = CGSizeMake(width * 0.37, height * 0.37);  // like a ~32" TV
-    descriptor.vendorID = 0x7456;   // made-up IDs so macOS remembers this "monitor"
+    descriptor.maxPixelsWide = gWidth;
+    descriptor.maxPixelsHigh = gHeight;
+    descriptor.sizeInMillimeters = CGSizeMake(gWidth * 0.37, gHeight * 0.37);  // like a ~32" TV
+    descriptor.vendorID = 0x7456;    // made-up IDs so macOS remembers this "monitor"
     descriptor.productID = 0x4D52;
-    descriptor.serialNum = 0x0001;
+    descriptor.serialNum = (unsigned int)gAttempt;   // each retry looks like a new monitor
     descriptor.terminationHandler = ^(id unused, CGVirtualDisplay *display) {
+        if (gReplacing) return;      // we removed it ourselves to try again
         fprintf(stderr, "The virtual screen was removed by macOS.\n");
         exit(1);
     };
@@ -747,39 +793,44 @@ static void createDisplay(unsigned int width, unsigned int height) {
 
     CGVirtualDisplaySettings *settings = [[Settings alloc] init];
     settings.hiDPI = 0;   // 1 screen pixel = 1 TV pixel
-    settings.modes = @[ [[Mode alloc] initWithWidth:width height:height refreshRate:60] ];
+    settings.modes = @[ [[Mode alloc] initWithWidth:gWidth height:gHeight refreshRate:60] ];
     if (![display applySettings:settings]) {
-        fprintf(stderr, "Couldn't set the virtual screen to %ux%u.\n", width, height);
+        fprintf(stderr, "Couldn't set the virtual screen to %ux%u.\n", gWidth, gHeight);
         exit(4);
     }
     gDisplay = display;
+    waitUntilOnline(display.displayID, 0);
+}
 
-    CGDirectDisplayID newID = display.displayID;
-    printf("%u\n", newID);
-    fflush(stdout);
+// Creates the screen once macOS has finished starting us up as an app.
+@interface VDAppDelegate : NSObject <NSApplicationDelegate>
+@end
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        reportAndFix(newID);
+@implementation VDAppDelegate
+- (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC / 10), dispatch_get_main_queue(), ^{
+        createDisplay();
     });
 }
+@end
+
+static VDAppDelegate *gDelegate;     // NSApp only keeps a weak reference
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        unsigned int width  = argc > 1 ? (unsigned int)atoi(argv[1]) : 1920;
-        unsigned int height = argc > 2 ? (unsigned int)atoi(argv[2]) : 1080;
-        if (width < 640 || height < 480) { width = 1920; height = 1080; }
+        if (argc > 1) gWidth = (unsigned int)atoi(argv[1]);
+        if (argc > 2) gHeight = (unsigned int)atoi(argv[2]);
+        if (gWidth < 640 || gHeight < 480) { gWidth = 1920; gHeight = 1080; }
 
         signal(SIGTERM, quit);
         signal(SIGINT, quit);
+        signal(SIGHUP, quit);
 
         // Become a hidden background app so macOS connects us to the window server.
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
-
-        // Create the screen once the app is up and running.
-        dispatch_async(dispatch_get_main_queue(), ^{
-            createDisplay(width, height);
-        });
+        gDelegate = [[VDAppDelegate alloc] init];
+        [NSApp setDelegate:gDelegate];
 
         // Keep running (and keep the screen alive) until TV Mirror stops us.
         [NSApp run];
@@ -857,16 +908,30 @@ def start_virtual_display(size):
     if not exe:
         return None, None
 
+    # Close helpers left over from a TV Mirror that didn't shut down properly:
+    # their screens can stop macOS from switching a new one on.
+    subprocess.run(["pkill", "-f", "/.tv-mirror-build/vdisplay-"], capture_output=True)
+    time.sleep(0.5)
+
     before = set(list_devices()[0])
+    print("Creating the invisible screen...")
     proc = subprocess.Popen([exe, str(width), str(height)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    ready, _, _ = select.select([proc.stdout], [], [], 10)
+    # The helper prints the screen's ID once macOS has really switched it on
+    # (it retries a few times if needed, so this can take ~20 seconds).
+    ready, _, _ = select.select([proc.stdout], [], [], 25)
     display_id = proc.stdout.readline().strip() if ready else ""
     if not display_id.isdigit():
         if proc.poll() is None:
             proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         err = proc.stderr.read().strip()
-        print("Couldn't create the virtual screen." + (f"\n{err}" if err else ""))
+        print("Couldn't create the virtual screen. Please send this report:\n"
+              + (err or "(the helper said nothing)") +
+              "\nTip: restarting the Mac usually clears this up.")
         return None, None
 
     # Wait for ffmpeg to see the new screen
