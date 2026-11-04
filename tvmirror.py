@@ -19,6 +19,7 @@ Press Ctrl+C to stop.
 """
 
 import argparse
+import bisect
 import atexit
 import hashlib
 import json
@@ -43,7 +44,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 APP_NAME = "TV Mirror"
-VERSION = "1.8"
+VERSION = "1.9"
 REPO = "nizarhalim05/tv-mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -373,6 +374,71 @@ def ffmpeg_command(args):
     return cmd
 
 
+class LiveFile:
+    """One play session's live stream, kept as an ever-growing "file".
+
+    Some TVs (like older Sonys) don't stream a video: they download it in pieces
+    ("bytes 0-2,000,000", then "2,000,000-4,000,000", ...). Each piece must carry on
+    exactly where the previous one stopped, so we keep the recent stream with its
+    byte positions. A TV asking for bytes that don't exist yet simply waits for them.
+    """
+    KEEP = 128 * 1024 * 1024        # keep the last 128 MB (about 2 minutes at 8 Mbit/s)
+
+    def __init__(self, generation):
+        self.generation = generation
+        self.cond = threading.Condition()
+        self.offsets, self.chunks = [], []
+        self.first = 0               # index of the oldest chunk still kept
+        self.start = 0               # byte position of the oldest byte still kept
+        self.end = 0                 # bytes so far
+        self.max_read = 0            # furthest byte a TV has downloaded
+        self.waiting = True          # until the first complete frame arrives
+        self.closed = False
+
+    def append(self, data):
+        with self.cond:
+            self.offsets.append(self.end)
+            self.chunks.append(data)
+            self.end += len(data)
+            while self.end - self.start > self.KEEP and self.first < len(self.chunks) - 1:
+                self.chunks[self.first] = None
+                self.first += 1
+                self.start = self.offsets[self.first]
+            if self.first > 4096:    # tidy up the lists now and then
+                del self.offsets[:self.first], self.chunks[:self.first]
+                self.first = 0
+            self.cond.notify_all()
+
+    def close(self):
+        with self.cond:
+            self.closed = True
+            self.cond.notify_all()
+
+    def read(self, offset, max_len, timeout):
+        """Up to max_len bytes from `offset`, waiting for them if needed.
+        Returns (data, offset actually used); data is None on timeout, b"" once closed."""
+        with self.cond:
+            deadline = time.time() + timeout
+            while self.end <= offset and not self.closed:
+                left = deadline - time.time()
+                if left <= 0:
+                    return None, offset
+                self.cond.wait(left)
+            if self.end <= offset:
+                return b"", offset
+            offset = max(offset, self.start)          # older data is gone
+            i = bisect.bisect_right(self.offsets, offset, self.first) - 1
+            out, n, pos = [], 0, offset
+            while i < len(self.chunks) and n < max_len:
+                piece = self.chunks[i][pos - self.offsets[i]:][:max_len - n]
+                out.append(piece)
+                n += len(piece)
+                pos += len(piece)
+                i += 1
+            self.max_read = max(self.max_read, pos)
+            return b"".join(out), offset
+
+
 class Broadcaster:
     """Reads the live stream from ffmpeg once and hands it to every connected TV."""
 
@@ -383,6 +449,23 @@ class Broadcaster:
         self.max_backlog = 1024 * 1024   # bytes a TV may fall behind before we skip ahead
         self.drops = 0                   # how many times a TV fell too far behind
         self.produced = 0                # bytes of video made so far
+        self.livefile = None             # the current play session as a growing file
+        self.generation = 0
+
+    def new_file(self):
+        """Start a new play session (a new "file" for the TV). Returns its number."""
+        with self.lock:
+            if self.livefile:
+                self.livefile.close()
+            self.generation += 1
+            self.livefile = LiveFile(self.generation)
+            return self.generation
+
+    def end_file(self):
+        with self.lock:
+            if self.livefile:
+                self.livefile.close()
+            self.livefile = None
 
     def subscribe(self):
         q = queue.Queue()
@@ -415,6 +498,15 @@ class Broadcaster:
 
     def publish(self, chunk):
         self.produced += len(chunk)
+        lf = self.livefile
+        if lf is not None:
+            if lf.waiting:           # a new "file" starts with a complete frame
+                k = self.keyframe_offset(chunk)
+                if k >= 0:
+                    lf.waiting = False
+                    lf.append(chunk[k:])
+            else:
+                lf.append(chunk)
         with self.lock:
             clients = list(self.clients)
         start = None
@@ -444,6 +536,8 @@ class Broadcaster:
         self.running = False
         with self.lock:
             clients = list(self.clients)
+            if self.livefile:
+                self.livefile.close()
         for q in clients:
             try:
                 q.put_nowait(None)
@@ -469,6 +563,8 @@ class Broadcaster:
         with self.lock:
             clients = list(self.clients)
             self.clients.clear()
+            if self.livefile:
+                self.livefile.close()
         for q in clients:
             with q.mutex:
                 q.queue.clear()
@@ -479,6 +575,22 @@ class Broadcaster:
 
 
 BROADCASTER = Broadcaster()
+
+
+SESSION_LOG_PATH = os.path.join(os.path.expanduser("~"), ".tv-mirror-build", "last-session.log")
+_session_log = {"f": None, "lock": threading.Lock()}
+
+
+def session_log(msg):
+    """Note what the TV does in a file, for troubleshooting."""
+    with _session_log["lock"]:
+        try:
+            if _session_log["f"] is None:
+                os.makedirs(os.path.dirname(SESSION_LOG_PATH), exist_ok=True)
+                _session_log["f"] = open(SESSION_LOG_PATH, "w", buffering=1)
+            _session_log["f"].write(time.strftime("%H:%M:%S") + f"{time.time() % 1:.2f}"[1:] + " " + msg + "\n")
+        except Exception:
+            pass
 
 
 def log(msg):
@@ -509,7 +621,9 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
         return pn + op + "DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 
     def _log_request(self):
-        if self.debug:
+        session_log(f"{self.client_address[0]} {self.command} {self.path} "
+                    + "; ".join(f"{k}: {v}" for k, v in self.headers.items()))
+        if self.debug and self.mode != "sony":
             hdrs = "; ".join(f"{k}: {v}" for k, v in self.headers.items())
             print(f"  [debug] {self.command} {self.path} | {hdrs}")
 
@@ -558,6 +672,100 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
         return True, length, chunked
 
+    NULL_PACKET = b"\x47\x1f\xff\x10" + b"\xff" * 184   # an empty MPEG-TS packet
+    PROBE_GAP = 64 * 1024 * 1024    # asking this far past the live edge = "peek at the end"
+
+    def _file_request(self):
+        """For "sony" mode: work out which session and byte range the TV wants."""
+        lf = BROADCASTER.livefile
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        gen = query.get("g", [None])[0]
+        if lf is None or (gen is not None and gen != str(lf.generation)):
+            return None, 0, 0, False     # an old session
+        m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+        start = int(m.group(1)) if m and m.group(1) else 0
+        last = int(m.group(2)) if m and m.group(2) else self.FAKE_LENGTH - 1
+        start, last = min(start, self.FAKE_LENGTH - 1), min(last, self.FAKE_LENGTH - 1)
+        return lf, start, last, bool(m)
+
+    def _file_headers(self, start, last, ranged):
+        if ranged:
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{last}/{self.FAKE_LENGTH}")
+        else:
+            self.send_response(200)
+        self.send_header("Content-Length", str(last - start + 1))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Type", MIME)
+        self.send_header("transferMode.dlna.org", "Streaming")
+        self.send_header("contentFeatures.dlna.org", self._features())
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+    def _serve_file(self):
+        lf, start, last, ranged = self._file_request()
+        who = self.client_address[0]
+        rng = self.headers.get("Range", "(whole file)")
+        if lf is None:
+            session_log(f"{who} {self.command} {rng}: old session -> 404")
+            self.send_error(404)
+            return
+        self._file_headers(start, last, ranged)
+        if self.command == "HEAD":
+            session_log(f"{who} HEAD {rng}")
+            return
+        try:
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
+        except OSError:
+            pass
+        length, sent, began = last - start + 1, 0, time.time()
+        probe = start > lf.end + self.PROBE_GAP
+        session_log(f"{who} GET {rng} (live edge at {lf.end}){' = peek at the end' if probe else ''}")
+        if self.debug:
+            print(f"  [debug] GET {rng}{' (peek at the end)' if probe else ''}, live edge at {lf.end}")
+        else:
+            log(f"  -> {who} connected to the stream")
+        reason = "TV closed the connection"
+        try:
+            if probe:
+                # The end of the "file" doesn't exist yet. Give the TV empty packets,
+                # so it finds no timestamps there and treats the video as open-ended.
+                block = self.NULL_PACKET * 350
+                while sent < min(length, 4 * 1024 * 1024):
+                    part = block[:min(length, 4 * 1024 * 1024) - sent]
+                    self.wfile.write(part)
+                    sent += len(part)
+                reason = "sent filler for the peek"
+            else:
+                pos = start
+                while sent < length:
+                    data, used = lf.read(pos, min(256 * 1024, length - sent), timeout=15)
+                    if data is None:
+                        reason = "no new video for 15 s"
+                        break
+                    if not data:
+                        reason = "play session ended"
+                        break
+                    if used != pos:
+                        session_log(f"{who} asked for old data at {pos}, sending from {used}")
+                        pos = used
+                    self.wfile.write(data)
+                    sent += len(data)
+                    pos += len(data)
+                    StreamHandler.delivered += len(data)
+                if sent >= length:
+                    reason = "sent everything the TV asked for"
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        took = time.time() - began
+        session_log(f"{who} done {rng}: {sent} bytes in {took:.1f}s ({reason})")
+        if self.debug:
+            print(f"  [debug] done {rng}: {sent // 1024} KB in {took:.1f}s ({reason})")
+        else:
+            log(f"  <- {who} disconnected")
+
     def _valid_path(self):
         return urllib.parse.urlparse(self.path).path == STREAM_PATH
 
@@ -566,12 +774,18 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
         if not self._valid_path():
             self.send_error(404)
             return
+        if self.mode == "sony":
+            self._serve_file()
+            return
         self._send_headers()
 
     def do_GET(self):
         self._log_request()
         if not self._valid_path():
             self.send_error(404)
+            return
+        if self.mode == "sony":
+            self._serve_file()
             return
         ok, limit, chunked = self._send_headers()
         if not ok:
@@ -1222,8 +1436,17 @@ def main():
                 proc.kill()
 
     def play_on_tv():
+        # Every play starts a new "file" (with its own address), so the TV never mixes
+        # up pieces of an old session with the new one.
+        if StreamHandler.mode == "sony":
+            play_url = f"{url}?g={BROADCASTER.new_file()}"
+        else:
+            BROADCASTER.end_file()
+            play_url = url
+        session_log(f"play {play_url} ({args.encoder} video, {args.audio_codec} sound, "
+                    f"{args.rate:g} Mbit/s, mode {StreamHandler.mode})")
         if tv:
-            tv_play(tv, url)
+            tv_play(tv, play_url)
 
     def reset_lag(restart_video=False):
         """Make the TV start over from 'now', which throws away its built-up delay."""
@@ -1281,6 +1504,7 @@ def main():
                 break
         print("Mirroring! It can take a few seconds to appear.")
     else:
+        play_on_tv()
         print("Serve-only mode: open the URL above in VLC (File > Open Network).")
 
     if terminal_clock:
@@ -1307,6 +1531,13 @@ def main():
                     log("\nScreen capture stopped unexpectedly.")
                     break
                 key = keys.read(0.25)
+                lf = BROADCASTER.livefile
+                if (lf is not None and lf.max_read and time.time() - last_warning > 20
+                        and time.time() - last_reset > 20
+                        and lf.end - lf.max_read > 10 * args.rate * 1e6 / 8):
+                    last_warning = time.time()
+                    log(f"  ! The TV is more than 10 s behind (Wi-Fi too slow for {args.rate:g} Mbit/s?). "
+                        "Press - for a smaller stream, or R to catch up.")
                 if BROADCASTER.drops > warned_drops and time.time() - last_warning > 10:
                     warned_drops, last_warning = BROADCASTER.drops, time.time()
                     log(f"  ! The TV can't keep up with {args.rate:g} Mbit/s over your Wi-Fi, "

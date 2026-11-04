@@ -146,6 +146,9 @@ the TV gets the picture with silence. To send sound too:
 
 ## Troubleshooting
 
+- **Something's not right?** TV Mirror writes down everything the TV asks for in
+  `~/.tv-mirror-build/last-session.log`. Attach that file when asking for help.
+
 - **The TV says "Playback not available"**: when it starts, TV Mirror watches
   whether the TV really downloads the video and, if not, automatically tries
   other formats, ending with one older Sony TVs are known to play. It remembers
@@ -167,7 +170,9 @@ the TV gets the picture with silence. To send sound too:
    H.264 (x264 with filler data) plus MP2 audio into an MPEG-TS stream.
 2. A small web server built into the script serves the stream on port 8090.
    For older Sony TVs it pretends the stream is a very long video file, since
-   they refuse endless streams.
+   they refuse endless streams. These TVs download the "file" in pieces, so the
+   server keeps the recent stream with its byte positions and gives every piece
+   exactly the bytes that follow the previous one (a "growing file").
 3. The TV is found with an **SSDP** search, then told to play the stream with
    **UPnP AVTransport** commands (`SetAVTransportURI` and `Play`).
 
