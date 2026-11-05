@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 APP_NAME = "TV Mirror"
-VERSION = "2.3"
+VERSION = "2.4"
 REPO = "nizarhalim05/tv-mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -1641,6 +1641,19 @@ def main():
         print("Screens:", *(screens or ["(none found - check Screen Recording permission)"]), sep="\n  ")
         print("Audio devices:", *(audio or ["(none)"]), sep="\n  ")
         return
+
+    # No choice given on the command line: ask what the TV should show
+    if (not args.virtual_display and not args.screen and not args.test_pattern
+            and not args.serve_only and sys.stdin.isatty()):
+        print("\nWhat should the TV show?\n"
+              "  1. Your screen: the TV copies what you see on your Mac\n"
+              "  2. An extra screen: use the TV as a second monitor, and keep working\n"
+              "     on your Mac while it shows something else")
+        choice = ""
+        while choice not in ("1", "2"):
+            choice = input("Type 1 or 2 and press Enter: ").strip()
+        args.virtual_display = choice == "2"
+        print()
 
     vd_screen, vd_proc = None, None
     if args.virtual_display and not args.test_pattern:

@@ -35,7 +35,8 @@ TV Mirror prints its version number when it starts, so you can check.
 
 1. Turn on your TV and make sure it's on the **same Wi-Fi** as your Mac.
 2. Double-click **TV Mirror** on your Desktop.
-3. If you have more than one screen, type the number of the one to mirror.
+3. Choose what the TV shows: **1** = your screen, **2** = an extra screen
+   (the TV becomes a second monitor). With more than one screen, it then asks which one.
 4. Your screen appears on the TV after a few seconds.
 5. To stop, press **Q** (or close the window).
 
