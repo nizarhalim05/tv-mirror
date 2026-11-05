@@ -19,7 +19,7 @@ if ! command -v brew >/dev/null 2>&1; then
 fi
 if ! command -v brew >/dev/null 2>&1; then
   echo "Installing Homebrew (it will ask for your Mac password)..."
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/tty
   for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
     [[ -x "$b" ]] && eval "$("$b" shellenv)"
   done
@@ -28,7 +28,14 @@ fi
 # 2. ffmpeg
 if ! command -v ffmpeg >/dev/null 2>&1; then
   echo "Installing ffmpeg (a few minutes)..."
-  brew install ffmpeg
+  # </dev/null: stop brew reading the rest of this script (when run as "curl ... | bash")
+  if ! brew install ffmpeg </dev/null; then
+    echo
+    echo "Installing ffmpeg failed. On older macOS (13 or earlier) Homebrew has to build it"
+    echo "from scratch, which needs up-to-date developer tools. Fix: update macOS in"
+    echo "System Settings > General > Software Update, then run this installer again."
+    exit 1
+  fi
 fi
 
 # 3. Python 3 (comes with macOS developer tools)
@@ -43,7 +50,7 @@ fi
 if ! xcode-select -p >/dev/null 2>&1; then
   echo "Apple's developer tools are needed. A window will pop up: click Install,"
   echo "wait for it to finish, then run this installer again."
-  xcode-select --install || true
+  xcode-select --install </dev/null || true
   exit 1
 fi
 
