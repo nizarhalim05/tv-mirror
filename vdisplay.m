@@ -83,7 +83,7 @@ static CGVirtualDisplay *gDisplay;   // kept for as long as the program runs
 static unsigned int gWidth = 1920, gHeight = 1080;
 static int gAttempt = 0;
 static BOOL gReplacing = NO;         // YES while we remove a screen on purpose
-static const int kMaxAttempts = 4;
+static const int kMaxAttempts = 2;
 static BOOL gWantPreview = YES;
 static BOOL gTickMode = NO;
 
@@ -144,7 +144,9 @@ static void waitUntilOnline(CGDirectDisplayID newID, int checks) {
         }
         return;
     }
-    if (checks < 12) {               // keep waiting, up to 3 seconds
+    // macOS may first show its own window asking how to use the new screen
+    // (extend or mirror); the screen stays off until you answer, so wait up to 2 minutes.
+    if (checks < 480) {              // keep waiting, up to 2 minutes
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 4), dispatch_get_main_queue(), ^{
             waitUntilOnline(newID, checks + 1);
         });

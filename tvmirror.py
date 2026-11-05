@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 APP_NAME = "TV Mirror"
-VERSION = "2.4"
+VERSION = "2.5"
 REPO = "nizarhalim05/tv-mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -936,7 +936,7 @@ static CGVirtualDisplay *gDisplay;   // kept for as long as the program runs
 static unsigned int gWidth = 1920, gHeight = 1080;
 static int gAttempt = 0;
 static BOOL gReplacing = NO;         // YES while we remove a screen on purpose
-static const int kMaxAttempts = 4;
+static const int kMaxAttempts = 2;
 static BOOL gWantPreview = YES;
 static BOOL gTickMode = NO;
 
@@ -997,7 +997,9 @@ static void waitUntilOnline(CGDirectDisplayID newID, int checks) {
         }
         return;
     }
-    if (checks < 12) {               // keep waiting, up to 3 seconds
+    // macOS may first show its own window asking how to use the new screen
+    // (extend or mirror); the screen stays off until you answer, so wait up to 2 minutes.
+    if (checks < 480) {              // keep waiting, up to 2 minutes
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 4), dispatch_get_main_queue(), ^{
             waitUntilOnline(newID, checks + 1);
         });
@@ -1414,7 +1416,9 @@ def start_virtual_display(size, preview=True):
     time.sleep(0.5)
 
     before = set(list_devices()[0])
-    print("Creating the invisible screen...")
+    print("Creating the invisible screen...\n"
+          "macOS may now show its own window asking how to use the new screen.\n"
+          "Choose to use it as a SEPARATE / EXTENDED display (not mirror).")
     proc = subprocess.Popen([exe, str(width), str(height), "1" if preview else "0"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     helper_lines = []
@@ -1427,8 +1431,8 @@ def start_virtual_display(size, preview=True):
     threading.Thread(target=drain, daemon=True).start()
 
     # The helper prints the screen's ID once macOS has really switched it on
-    # (it retries a few times if needed, so this can take ~20 seconds).
-    ready, _, _ = select.select([proc.stdout], [], [], 25)
+    # (it waits for you to answer macOS's question, up to 2 minutes per try).
+    ready, _, _ = select.select([proc.stdout], [], [], 260)
     display_id = proc.stdout.readline().strip() if ready else ""
     if not display_id.isdigit():
         stop_helper(proc)
