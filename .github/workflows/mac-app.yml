@@ -1,0 +1,29 @@
+name: Build Mac app
+
+on:
+  push:
+    branches: [main]
+    paths: ["mac-app/**", ".github/workflows/mac-app.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build TV Mirror.app
+        run: bash mac-app/build-app.sh
+
+      - name: Publish the download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete mac-app --cleanup-tag --yes || true
+          gh release create mac-app "mac-app/build/TV-Mirror-Mac.zip" \
+            --title "TV Mirror for Mac (app)" \
+            --target "${{ github.sha }}" \
+            --notes "Download TV-Mirror-Mac.zip below, open it, and drag TV Mirror into your Applications folder. See the README for the first-time steps."
