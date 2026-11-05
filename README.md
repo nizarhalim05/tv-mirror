@@ -52,14 +52,30 @@ python3 ~/tv-mirror/tvmirror.py --virtual-display
 1. The first time, it builds a small helper (a few seconds). If it asks for
    Apple's developer tools, run `xcode-select --install` and try again.
 2. A new screen called **TV Mirror Display** appears and goes to the TV.
-3. To put a window on the TV, hover over the window's green button and
-   choose **Move to TV Mirror Display** (or drag it off the right edge of
-   your screen).
+3. A small window called **TV screen (live)** shows that screen on your Mac
+   with **no delay**. Keep an eye on it while you work on the TV screen.
 4. Keep working on your normal desktops; the TV keeps showing that screen.
 5. When you quit TV Mirror, the screen disappears and its windows come back.
 
 Make sure **System Settings > Desktop & Dock > Displays have separate Spaces**
 is on, so swiping between your desktops doesn't affect the TV.
+
+### Putting a website (or any window) on the TV
+
+1. For a single browser tab: right-click the tab and choose
+   **Move Tab to New Window**.
+2. Hover over the window's green button and choose
+   **Move to TV Mirror Display**.
+3. Straight away, press **Ctrl + Cmd + F**: the window goes full screen and
+   fills the TV. (Press it again to leave full screen.) For YouTube, press
+   **F** to make the video fill the screen.
+
+To drag, click or resize things on the TV screen, move your mouse off the
+edge of your screen onto the TV screen (usually the right edge) and watch the
+**TV screen (live)** window, not the TV, which shows everything a few seconds
+later. You can also click a spot in the live window to make your mouse
+pointer jump straight to that spot on the TV screen. Press **P** in TV Mirror
+to show or hide the live window.
 
 ## Controls while it's running
 
@@ -68,6 +84,7 @@ Click the TV Mirror (Terminal) window, then press:
 | Key | What it does |
 |---|---|
 | **1**, **2**, **3**... | Switch to that screen |
+| **P** | Show/hide the live preview of the TV screen (with `--virtual-display`) |
 | **R** | Reset the delay: the TV starts again from "now" |
 | **+** / **-** | Bigger / smaller stream (bigger = less delay, needs better Wi-Fi) |
 | **F** | Try the next video format (if the TV shows an error like "Playback not available") |
@@ -89,6 +106,7 @@ Run these in Terminal, inside the `~/tv-mirror` folder (`cd ~/tv-mirror`):
 | `python3 tvmirror.py --screen 2` | Mirror screen 2 without asking |
 | `python3 tvmirror.py --rate 12` | Stream size in Mbit/s (default 8). Bigger = less delay, needs better Wi-Fi |
 | `python3 tvmirror.py --virtual-display` | Add an invisible extra screen for the TV (see above) |
+| `python3 tvmirror.py --virtual-display --no-preview` | The same, without the live preview window |
 | `python3 tvmirror.py --show-clock` | Show a clock on the TV so you can measure the delay |
 | `python3 tvmirror.py --auto-reset 5` | Reset the delay automatically every 5 minutes |
 | `python3 tvmirror.py --tv "Bravia"` | Pick a TV by name or IP address if you have several |
@@ -146,6 +164,11 @@ the TV gets the picture with silence. To send sound too:
 
 ## Troubleshooting
 
+- **"Couldn't create the invisible screen: macOS didn't switch it on"**: this is
+  a temporary macOS problem; restarting the Mac fixes it. TV Mirror offers to
+  mirror your main screen instead in the meantime, and saves the details in
+  `~/.tv-mirror-build/virtual-screen-report.txt`.
+
 - **Something's not right?** TV Mirror writes down everything the TV asks for in
   `~/.tv-mirror-build/last-session.log`. Attach that file when asking for help.
 
@@ -177,7 +200,8 @@ the TV gets the picture with silence. To send sound too:
    **UPnP AVTransport** commands (`SetAVTransportURI` and `Play`).
 
 The invisible screen comes from `vdisplay.m`, a small Objective-C program
-that uses macOS's built-in (undocumented) `CGVirtualDisplay` feature. TV
+that uses macOS's built-in (undocumented) `CGVirtualDisplay` feature, and
+shows the live preview with `CGDisplayStream`. TV
 Mirror compiles it on your Mac the first time you use `--virtual-display`.
 
 Everything else uses Python's standard library plus ffmpeg.

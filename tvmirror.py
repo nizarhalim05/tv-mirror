@@ -25,10 +25,12 @@ import hashlib
 import json
 import http.server
 import os
+import platform
 import queue
 import re
 import select
 import shutil
+import signal
 import socket
 import socketserver
 import subprocess
@@ -44,7 +46,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 APP_NAME = "TV Mirror"
-VERSION = "1.9"
+VERSION = "2.0"
 REPO = "nizarhalim05/tv-mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -842,7 +844,8 @@ class StreamServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 # Source of the small helper program; it's compiled on your Mac the first time.
 # The same code is in vdisplay.m in the repository, with comments.
-VDISPLAY_SOURCE = r'''// vdisplay - creates an invisible extra screen ("virtual display") on macOS.
+VDISPLAY_SOURCE = r'''// vdisplay - creates an invisible extra screen ("virtual display") on macOS,
+// plus a small live preview window of it on your normal screen.
 //
 // macOS only draws the desktop you're looking at, so a desktop you've swiped away
 // from can't be recorded. A virtual display is a screen macOS *always* draws,
@@ -858,15 +861,27 @@ VDISPLAY_SOURCE = r'''// vdisplay - creates an invisible extra screen ("virtual 
 // previous one was removed), so this waits until it's really on, and otherwise
 // removes it and tries again as a "new" monitor, up to 4 times.
 //
-// Build:  clang -fobjc-arc -framework AppKit -framework Foundation -framework CoreGraphics vdisplay.m -o vdisplay
-// Run:    ./vdisplay 1920 1080        (prints the new screen's display ID once it's on)
+// Live preview: a window on your real screen that shows the TV screen in real time
+// (the TV itself shows it a few seconds later), so you can see your mouse pointer
+// there and move/resize windows. Clicking in it makes the pointer jump to that spot
+// on the TV screen. Sending SIGUSR1 shows/hides it. It uses CGDisplayStream, looked
+// up while running because newer macOS SDKs hide it; if it's missing, everything
+// else still works, just without the preview.
+//
+// Build:  clang -fobjc-arc -framework AppKit -framework Foundation -framework CoreGraphics \
+//                -framework QuartzCore vdisplay.m -o vdisplay
+// Run:    ./vdisplay 1920 1080 1     (prints the screen's ID once it's on; last number:
+//                                     1 = show the live preview, 0 = don't)
 
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <QuartzCore/QuartzCore.h>
+#include <dlfcn.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 // ---- Declarations for the undocumented CoreGraphics classes ----------------
 
@@ -908,8 +923,10 @@ static unsigned int gWidth = 1920, gHeight = 1080;
 static int gAttempt = 0;
 static BOOL gReplacing = NO;         // YES while we remove a screen on purpose
 static const int kMaxAttempts = 4;
+static BOOL gWantPreview = YES;
 
 static void createDisplay(void);
+static void startPreview(CGDirectDisplayID displayID);
 
 static BOOL isOnline(CGDirectDisplayID displayID) {
     CGDirectDisplayID online[16];
@@ -951,6 +968,11 @@ static void waitUntilOnline(CGDirectDisplayID newID, int checks) {
         report(newID);
         printf("%u\n", newID);       // tell TV Mirror the screen is ready
         fflush(stdout);
+        if (gWantPreview) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), dispatch_get_main_queue(), ^{
+                startPreview(newID);
+            });
+        }
         return;
     }
     if (checks < 12) {               // keep waiting, up to 3 seconds
@@ -1016,6 +1038,132 @@ static void createDisplay(void) {
     waitUntilOnline(display.displayID, 0);
 }
 
+// ---- Live preview -------------------------------------------------------------
+
+typedef void *VDStreamRef;
+typedef void (^VDFrameHandler)(int32_t status, uint64_t displayTime, void *frameSurface, const void *updateRef);
+typedef VDStreamRef (*VDStreamCreateFn)(CGDirectDisplayID display, size_t outputWidth, size_t outputHeight,
+                                        int32_t pixelFormat, CFDictionaryRef properties,
+                                        dispatch_queue_t queue, VDFrameHandler handler);
+typedef CGError (*VDStreamStartFn)(VDStreamRef stream);
+
+static CGDirectDisplayID gPreviewDisplay;
+static NSWindow *gPreview;
+static NSView *gPreviewView;
+static VDStreamRef gStream;
+static NSTimer *gPointerTimer;
+static dispatch_source_t gToggleSource;
+
+static NSScreen *screenForDisplay(CGDirectDisplayID displayID) {
+    for (NSScreen *screen in [NSScreen screens]) {
+        NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
+        if (number && number.unsignedIntValue == displayID) return screen;
+    }
+    return nil;
+}
+
+@interface VDPreviewView : NSView
+@end
+
+@implementation VDPreviewView
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
+
+// Clicking the preview makes the mouse pointer jump to the same spot on the TV screen.
+- (void)mouseDown:(NSEvent *)event {
+    NSRect bounds = self.bounds;
+    if (bounds.size.width < 1 || bounds.size.height < 1) return;
+    NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+    CGFloat rx = MAX(0.0, MIN(1.0, p.x / bounds.size.width));
+    CGFloat ry = MAX(0.0, MIN(1.0, 1.0 - p.y / bounds.size.height));   // screens count from the top
+    CGRect tv = CGDisplayBounds(gPreviewDisplay);
+    CGPoint target = CGPointMake(tv.origin.x + rx * (tv.size.width - 1),
+                                 tv.origin.y + ry * (tv.size.height - 1));
+    CGWarpMouseCursorPosition(target);
+    CGAssociateMouseAndMouseCursorPosition(1);
+}
+@end
+
+static void togglePreview(void) {
+    if (!gPreview) return;
+    if (gPreview.visible) [gPreview orderOut:nil];
+    else [gPreview orderFrontRegardless];
+}
+
+static void startPreview(CGDirectDisplayID displayID) {
+    gPreviewDisplay = displayID;
+    VDStreamCreateFn create = (VDStreamCreateFn)dlsym(RTLD_DEFAULT, "CGDisplayStreamCreateWithDispatchQueue");
+    VDStreamStartFn start = (VDStreamStartFn)dlsym(RTLD_DEFAULT, "CGDisplayStreamStart");
+    if (!create || !start) {
+        fprintf(stderr, "[vdisplay] the live preview isn't available on this version of macOS\n");
+        return;
+    }
+
+    // Put it in the bottom-right corner of one of your real screens
+    NSScreen *home = nil;
+    for (NSScreen *screen in [NSScreen screens]) {
+        NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
+        if (number && number.unsignedIntValue != displayID) { home = screen; break; }
+    }
+    if (!home) {
+        fprintf(stderr, "[vdisplay] no real screen found for the live preview\n");
+        return;
+    }
+    NSRect area = home.visibleFrame;
+    CGFloat w = 480, h = round(w * gHeight / gWidth);
+    NSRect frame = NSMakeRect(NSMaxX(area) - w - 20, NSMinY(area) + 20, w, h);
+
+    NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
+                                                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                                             NSWindowStyleMaskResizable
+                                                     backing:NSBackingStoreBuffered
+                                                       defer:NO];
+    window.title = @"TV screen (live)";
+    window.releasedWhenClosed = NO;
+    window.contentAspectRatio = NSMakeSize(gWidth, gHeight);
+    window.contentMinSize = NSMakeSize(240, round(240.0 * gHeight / gWidth));
+    window.level = NSFloatingWindowLevel;                                  // stays on top
+    window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |   // on every desktop
+                                NSWindowCollectionBehaviorFullScreenAuxiliary;
+
+    VDPreviewView *view = [[VDPreviewView alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
+    view.wantsLayer = YES;
+    view.layer.backgroundColor = NSColor.blackColor.CGColor;
+    view.layer.contentsGravity = kCAGravityResizeAspect;
+    window.contentView = view;
+    gPreviewView = view;
+
+    NSMutableDictionary *props = [NSMutableDictionary dictionary];
+    CFStringRef *showCursor = (CFStringRef *)dlsym(RTLD_DEFAULT, "kCGDisplayStreamShowCursor");
+    CFStringRef *minFrameTime = (CFStringRef *)dlsym(RTLD_DEFAULT, "kCGDisplayStreamMinimumFrameTime");
+    if (showCursor && *showCursor) props[(__bridge NSString *)*showCursor] = @YES;
+    if (minFrameTime && *minFrameTime) props[(__bridge NSString *)*minFrameTime] = @(1.0 / 30.0);
+
+    VDStreamRef stream = create(displayID, (size_t)(w * 2), (size_t)(h * 2), 0x42475241 /* 'BGRA' */,
+                                (__bridge CFDictionaryRef)props, dispatch_get_main_queue(),
+                                ^(int32_t status, uint64_t displayTime, void *frameSurface, const void *updateRef) {
+        if (status == 0 /* a complete frame */ && frameSurface) {
+            gPreviewView.layer.contents = (__bridge id)frameSurface;
+        }
+    });
+    if (!stream || start(stream) != kCGErrorSuccess) {
+        fprintf(stderr, "[vdisplay] couldn't start the live preview\n");
+        return;
+    }
+    gStream = stream;
+    gPreview = window;
+    [window orderFrontRegardless];
+    fprintf(stderr, "[vdisplay] live preview started\n");
+
+    // The title says when your mouse pointer is on the TV screen
+    gPointerTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *timer) {
+        NSScreen *tv = screenForDisplay(gPreviewDisplay);
+        BOOL onTV = tv && NSPointInRect([NSEvent mouseLocation], tv.frame);
+        NSString *title = onTV ? @"TV screen (live) - your mouse pointer is on the TV"
+                               : @"TV screen (live) - click here to move the pointer to the TV";
+        if (![gPreview.title isEqualToString:title]) gPreview.title = title;
+    }];
+}
+
 // Creates the screen once macOS has finished starting us up as an app.
 @interface VDAppDelegate : NSObject <NSApplicationDelegate>
 @end
@@ -1035,10 +1183,17 @@ int main(int argc, const char *argv[]) {
         if (argc > 1) gWidth = (unsigned int)atoi(argv[1]);
         if (argc > 2) gHeight = (unsigned int)atoi(argv[2]);
         if (gWidth < 640 || gHeight < 480) { gWidth = 1920; gHeight = 1080; }
+        if (argc > 3 && strcmp(argv[3], "0") == 0) gWantPreview = NO;
 
         signal(SIGTERM, quit);
         signal(SIGINT, quit);
         signal(SIGHUP, quit);
+
+        // SIGUSR1 (TV Mirror's P key) shows/hides the live preview
+        signal(SIGUSR1, SIG_IGN);
+        gToggleSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGUSR1, 0, dispatch_get_main_queue());
+        dispatch_source_set_event_handler(gToggleSource, ^{ togglePreview(); });
+        dispatch_resume(gToggleSource);
 
         // Become a hidden background app so macOS connects us to the window server.
         [NSApplication sharedApplication];
@@ -1054,7 +1209,8 @@ int main(int argc, const char *argv[]) {
 '''
 
 
-MEMORY_FILE = os.path.join(os.path.expanduser("~"), ".tv-mirror-build", "tvs.json")
+BUILD_DIR = os.path.join(os.path.expanduser("~"), ".tv-mirror-build")
+MEMORY_FILE = os.path.join(BUILD_DIR, "tvs.json")
 
 
 def remembered_format(tv_name):
@@ -1099,7 +1255,7 @@ def build_vdisplay():
     print("Building the virtual screen helper (first time only)...")
     result = subprocess.run(
         [clang, "-fobjc-arc", "-framework", "AppKit", "-framework", "Foundation",
-         "-framework", "CoreGraphics",
+         "-framework", "CoreGraphics", "-framework", "QuartzCore",
          src, "-o", exe],
         capture_output=True, text=True,
     )
@@ -1109,7 +1265,57 @@ def build_vdisplay():
     return exe
 
 
-def start_virtual_display(size):
+def windowserver_log():
+    """Recent lines from the macOS system log about displays (to see why one stayed off)."""
+    try:
+        out = subprocess.run(
+            ["log", "show", "--last", "1m", "--info", "--style", "compact", "--predicate",
+             'process == "WindowServer" AND (eventMessage CONTAINS[c] "virtual" '
+             'OR eventMessage CONTAINS[c] "display" OR eventMessage CONTAINS[c] "TV Mirror")'],
+            capture_output=True, text=True, timeout=45).stdout
+    except Exception as e:
+        return [f"(couldn't read the system log: {e})"]
+    lines = [l for l in out.splitlines() if l.strip() and not l.startswith(("Timestamp", "Filtering"))]
+    return lines[-80:]
+
+
+def virtual_display_report(helper_lines, before, after):
+    """Explain a failed virtual screen and save the details for troubleshooting."""
+    print("Couldn't create the invisible screen: macOS didn't switch it on.")
+    print("Reading the macOS system log to find out why (a few seconds)...")
+    displays = subprocess.run("system_profiler SPDisplaysDataType | grep -E '^ {8}[^ ].*:$'",
+                              shell=True, capture_output=True, text=True).stdout.strip()
+    lines = [f"TV Mirror {VERSION}, macOS {platform.mac_ver()[0]}, {time.strftime('%Y-%m-%d %H:%M:%S')}",
+             "Helper said:"] + ["  " + l for l in (helper_lines or ["(nothing)"])]
+    lines += [f"Screens ffmpeg saw before: {sorted(before)}"]
+    if after is not None:
+        lines += [f"Screens ffmpeg saw after:  {after}"]
+    lines += ["Displays macOS lists:", displays or "  (none)", "WindowServer log:"]
+    lines += ["  " + l for l in (windowserver_log() or ["(nothing about displays)"])]
+    path = os.path.join(BUILD_DIR, "virtual-screen-report.txt")
+    try:
+        os.makedirs(BUILD_DIR, exist_ok=True)
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        path = None
+    for l in lines[1:1 + len(helper_lines or [1]) + 1]:
+        print(l)
+    print("\nThis is usually a temporary macOS problem: restarting the Mac fixes it.")
+    if path:
+        print(f"(Full details saved in {path})")
+
+
+def stop_helper(proc):
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def start_virtual_display(size, preview=True):
     """Create the invisible screen. Returns (process, ffmpeg screen name) or (None, None)."""
     if sys.platform != "darwin":
         print("The virtual screen only works on a Mac.")
@@ -1129,23 +1335,25 @@ def start_virtual_display(size):
 
     before = set(list_devices()[0])
     print("Creating the invisible screen...")
-    proc = subprocess.Popen([exe, str(width), str(height)],
+    proc = subprocess.Popen([exe, str(width), str(height), "1" if preview else "0"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    helper_lines = []
+
+    def drain():
+        # Keep reading the helper's messages (so it never gets stuck writing them)
+        for line in proc.stderr:
+            helper_lines.append(line.rstrip())
+            session_log("[helper] " + line.rstrip())
+    threading.Thread(target=drain, daemon=True).start()
+
     # The helper prints the screen's ID once macOS has really switched it on
     # (it retries a few times if needed, so this can take ~20 seconds).
     ready, _, _ = select.select([proc.stdout], [], [], 25)
     display_id = proc.stdout.readline().strip() if ready else ""
     if not display_id.isdigit():
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        err = proc.stderr.read().strip()
-        print("Couldn't create the virtual screen. Please send this report:\n"
-              + (err or "(the helper said nothing)") +
-              "\nTip: restarting the Mac usually clears this up.")
+        stop_helper(proc)
+        time.sleep(0.3)
+        virtual_display_report(helper_lines, before, None)
         return None, None
 
     # Wait for ffmpeg to see the new screen
@@ -1158,26 +1366,9 @@ def start_virtual_display(size):
         if new:
             return proc, new[-1]
         time.sleep(0.5)
-
-    # It didn't show up: print a report so we can see why
-    report = ""
-    alive = proc.poll() is None
-    if alive:
-        ready, _, _ = select.select([proc.stderr], [], [], 3)
-        if ready:
-            report = os.read(proc.stderr.fileno(), 4096).decode(errors="ignore").strip()
-        proc.terminate()
-    else:
-        report = proc.stderr.read().strip()
-    displays = subprocess.run("system_profiler SPDisplaysDataType | grep -E '^ {8}[^ ].*:$'",
-                              shell=True, capture_output=True, text=True).stdout.strip()
-    print("The virtual screen was created, but screen recording can't see it.\n"
-          "Please send this report:\n"
-          f"  helper still running: {'yes' if alive else 'no'}\n"
-          f"  helper says: {report or '(nothing)'}\n"
-          f"  screens ffmpeg sees before: {sorted(before)}\n"
-          f"  screens ffmpeg sees after:  {after}\n"
-          f"  displays macOS lists:\n{displays or '    (none)'}")
+    stop_helper(proc)
+    time.sleep(0.3)
+    virtual_display_report(helper_lines, before, after)
     return None, None
 
 
@@ -1307,6 +1498,8 @@ def main():
     p.add_argument("--virtual-display", action="store_true",
                    help="add an invisible extra screen and mirror that, so you can keep "
                         "working on your other desktops")
+    p.add_argument("--no-preview", action="store_true",
+                   help="don't show the live preview window of the invisible screen")
     p.add_argument("--virtual-size", default="1920x1080",
                    help="size of the virtual screen (default 1920x1080)")
     p.add_argument("--show-clock", action="store_true",
@@ -1367,18 +1560,30 @@ def main():
         print("Audio devices:", *(audio or ["(none)"]), sep="\n  ")
         return
 
-    vd_screen = None
+    vd_screen, vd_proc = None, None
     if args.virtual_display and not args.test_pattern:
-        vd_proc, vd_screen = start_virtual_display(args.virtual_size)
+        vd_proc, vd_screen = start_virtual_display(args.virtual_size, preview=not args.no_preview)
         if not vd_proc:
-            sys.exit(1)
-        atexit.register(lambda: vd_proc.poll() is None and vd_proc.terminate())
-        args.screen = vd_screen
-        print("\nAdded an invisible screen called 'TV Mirror Display'. Whatever is on it\n"
-              "goes to the TV, while you keep working on your normal screen and desktops.\n"
-              "To put a window on the TV: hover over its green button and choose\n"
-              "'Move to TV Mirror Display' (or drag it off the right edge of your screen).\n"
-              "When TV Mirror quits, the screen disappears and its windows come back.\n")
+            try:
+                answer = input("\nMirror your main screen instead? [Y/n] ").strip().lower()
+            except EOFError:
+                answer = "n"
+            if answer not in ("", "y", "yes"):
+                sys.exit(1)
+            args.screen = args.screen or "1"
+        else:
+            atexit.register(lambda: vd_proc.poll() is None and vd_proc.terminate())
+            args.screen = vd_screen
+            print("\nAdded an invisible screen called 'TV Mirror Display'. Whatever is on it goes\n"
+                  "to the TV, while you keep working on your normal screen and desktops.\n")
+            if not args.no_preview:
+                print("A small window called 'TV screen (live)' shows that screen on your Mac with no\n"
+                      "delay. Watch it while you move your mouse onto the TV screen (usually off the\n"
+                      "right edge of your screen) to drag or resize windows there. Click a spot in it\n"
+                      "to make your pointer jump there. Press P to show/hide it.\n")
+            print("To put a window on the TV: hover over its green button and choose\n"
+                  "'Move to TV Mirror Display'. To make it fill the TV, press Ctrl+Cmd+F straight\n"
+                  "after. When TV Mirror quits, the screen disappears and its windows come back.\n")
 
     if not args.test_pattern:
         args.screen = choose_screen(args.screen)
@@ -1514,6 +1719,8 @@ def main():
     print("\nControls (press a key in this window):")
     if len(screens) > 1:
         print(f"  1-{min(len(screens), 9)}  switch to that screen")
+    if vd_proc and not args.no_preview:
+        print("  P    show/hide the live preview of the TV screen")
     print("  R    reset the delay (TV restarts from 'now'; do this if it falls behind)\n"
           "  +/-  bigger / smaller stream (bigger = less delay, needs better Wi-Fi)\n"
           "  F    try the next video format (if the TV shows an error)\n"
@@ -1577,6 +1784,10 @@ def main():
                     last_reset = time.time()
                     warned_drops = BROADCASTER.drops   # forget older warnings
                     status()
+                elif key == "p":
+                    if vd_proc and vd_proc.poll() is None:
+                        os.kill(vd_proc.pid, signal.SIGUSR1)
+                        log("  Showing/hiding the live preview.")
                 elif key == "f":
                     keys_ = [(p[0], p[1]) for p in profiles]
                     i = keys_.index((args.encoder, args.audio_codec)) if (args.encoder, args.audio_codec) in keys_ else -1
@@ -1623,8 +1834,11 @@ def main():
             tv_stop(tv)
         BROADCASTER.close()
         stop_capture()
+        if vd_proc:
+            stop_helper(vd_proc)      # removes the invisible screen cleanly
         server.shutdown()
         log("Stopped.")
+        log(f"(A log of what the TV asked for is in {SESSION_LOG_PATH})")
 
 
 class KeyReader:

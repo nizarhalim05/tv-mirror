@@ -1,4 +1,5 @@
-// vdisplay - creates an invisible extra screen ("virtual display") on macOS.
+// vdisplay - creates an invisible extra screen ("virtual display") on macOS,
+// plus a small live preview window of it on your normal screen.
 //
 // macOS only draws the desktop you're looking at, so a desktop you've swiped away
 // from can't be recorded. A virtual display is a screen macOS *always* draws,
@@ -14,15 +15,27 @@
 // previous one was removed), so this waits until it's really on, and otherwise
 // removes it and tries again as a "new" monitor, up to 4 times.
 //
-// Build:  clang -fobjc-arc -framework AppKit -framework Foundation -framework CoreGraphics vdisplay.m -o vdisplay
-// Run:    ./vdisplay 1920 1080        (prints the new screen's display ID once it's on)
+// Live preview: a window on your real screen that shows the TV screen in real time
+// (the TV itself shows it a few seconds later), so you can see your mouse pointer
+// there and move/resize windows. Clicking in it makes the pointer jump to that spot
+// on the TV screen. Sending SIGUSR1 shows/hides it. It uses CGDisplayStream, looked
+// up while running because newer macOS SDKs hide it; if it's missing, everything
+// else still works, just without the preview.
+//
+// Build:  clang -fobjc-arc -framework AppKit -framework Foundation -framework CoreGraphics \
+//                -framework QuartzCore vdisplay.m -o vdisplay
+// Run:    ./vdisplay 1920 1080 1     (prints the screen's ID once it's on; last number:
+//                                     1 = show the live preview, 0 = don't)
 
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <QuartzCore/QuartzCore.h>
+#include <dlfcn.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 // ---- Declarations for the undocumented CoreGraphics classes ----------------
 
@@ -64,8 +77,10 @@ static unsigned int gWidth = 1920, gHeight = 1080;
 static int gAttempt = 0;
 static BOOL gReplacing = NO;         // YES while we remove a screen on purpose
 static const int kMaxAttempts = 4;
+static BOOL gWantPreview = YES;
 
 static void createDisplay(void);
+static void startPreview(CGDirectDisplayID displayID);
 
 static BOOL isOnline(CGDirectDisplayID displayID) {
     CGDirectDisplayID online[16];
@@ -107,6 +122,11 @@ static void waitUntilOnline(CGDirectDisplayID newID, int checks) {
         report(newID);
         printf("%u\n", newID);       // tell TV Mirror the screen is ready
         fflush(stdout);
+        if (gWantPreview) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), dispatch_get_main_queue(), ^{
+                startPreview(newID);
+            });
+        }
         return;
     }
     if (checks < 12) {               // keep waiting, up to 3 seconds
@@ -172,6 +192,132 @@ static void createDisplay(void) {
     waitUntilOnline(display.displayID, 0);
 }
 
+// ---- Live preview -------------------------------------------------------------
+
+typedef void *VDStreamRef;
+typedef void (^VDFrameHandler)(int32_t status, uint64_t displayTime, void *frameSurface, const void *updateRef);
+typedef VDStreamRef (*VDStreamCreateFn)(CGDirectDisplayID display, size_t outputWidth, size_t outputHeight,
+                                        int32_t pixelFormat, CFDictionaryRef properties,
+                                        dispatch_queue_t queue, VDFrameHandler handler);
+typedef CGError (*VDStreamStartFn)(VDStreamRef stream);
+
+static CGDirectDisplayID gPreviewDisplay;
+static NSWindow *gPreview;
+static NSView *gPreviewView;
+static VDStreamRef gStream;
+static NSTimer *gPointerTimer;
+static dispatch_source_t gToggleSource;
+
+static NSScreen *screenForDisplay(CGDirectDisplayID displayID) {
+    for (NSScreen *screen in [NSScreen screens]) {
+        NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
+        if (number && number.unsignedIntValue == displayID) return screen;
+    }
+    return nil;
+}
+
+@interface VDPreviewView : NSView
+@end
+
+@implementation VDPreviewView
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
+
+// Clicking the preview makes the mouse pointer jump to the same spot on the TV screen.
+- (void)mouseDown:(NSEvent *)event {
+    NSRect bounds = self.bounds;
+    if (bounds.size.width < 1 || bounds.size.height < 1) return;
+    NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+    CGFloat rx = MAX(0.0, MIN(1.0, p.x / bounds.size.width));
+    CGFloat ry = MAX(0.0, MIN(1.0, 1.0 - p.y / bounds.size.height));   // screens count from the top
+    CGRect tv = CGDisplayBounds(gPreviewDisplay);
+    CGPoint target = CGPointMake(tv.origin.x + rx * (tv.size.width - 1),
+                                 tv.origin.y + ry * (tv.size.height - 1));
+    CGWarpMouseCursorPosition(target);
+    CGAssociateMouseAndMouseCursorPosition(1);
+}
+@end
+
+static void togglePreview(void) {
+    if (!gPreview) return;
+    if (gPreview.visible) [gPreview orderOut:nil];
+    else [gPreview orderFrontRegardless];
+}
+
+static void startPreview(CGDirectDisplayID displayID) {
+    gPreviewDisplay = displayID;
+    VDStreamCreateFn create = (VDStreamCreateFn)dlsym(RTLD_DEFAULT, "CGDisplayStreamCreateWithDispatchQueue");
+    VDStreamStartFn start = (VDStreamStartFn)dlsym(RTLD_DEFAULT, "CGDisplayStreamStart");
+    if (!create || !start) {
+        fprintf(stderr, "[vdisplay] the live preview isn't available on this version of macOS\n");
+        return;
+    }
+
+    // Put it in the bottom-right corner of one of your real screens
+    NSScreen *home = nil;
+    for (NSScreen *screen in [NSScreen screens]) {
+        NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
+        if (number && number.unsignedIntValue != displayID) { home = screen; break; }
+    }
+    if (!home) {
+        fprintf(stderr, "[vdisplay] no real screen found for the live preview\n");
+        return;
+    }
+    NSRect area = home.visibleFrame;
+    CGFloat w = 480, h = round(w * gHeight / gWidth);
+    NSRect frame = NSMakeRect(NSMaxX(area) - w - 20, NSMinY(area) + 20, w, h);
+
+    NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
+                                                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                                             NSWindowStyleMaskResizable
+                                                     backing:NSBackingStoreBuffered
+                                                       defer:NO];
+    window.title = @"TV screen (live)";
+    window.releasedWhenClosed = NO;
+    window.contentAspectRatio = NSMakeSize(gWidth, gHeight);
+    window.contentMinSize = NSMakeSize(240, round(240.0 * gHeight / gWidth));
+    window.level = NSFloatingWindowLevel;                                  // stays on top
+    window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |   // on every desktop
+                                NSWindowCollectionBehaviorFullScreenAuxiliary;
+
+    VDPreviewView *view = [[VDPreviewView alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
+    view.wantsLayer = YES;
+    view.layer.backgroundColor = NSColor.blackColor.CGColor;
+    view.layer.contentsGravity = kCAGravityResizeAspect;
+    window.contentView = view;
+    gPreviewView = view;
+
+    NSMutableDictionary *props = [NSMutableDictionary dictionary];
+    CFStringRef *showCursor = (CFStringRef *)dlsym(RTLD_DEFAULT, "kCGDisplayStreamShowCursor");
+    CFStringRef *minFrameTime = (CFStringRef *)dlsym(RTLD_DEFAULT, "kCGDisplayStreamMinimumFrameTime");
+    if (showCursor && *showCursor) props[(__bridge NSString *)*showCursor] = @YES;
+    if (minFrameTime && *minFrameTime) props[(__bridge NSString *)*minFrameTime] = @(1.0 / 30.0);
+
+    VDStreamRef stream = create(displayID, (size_t)(w * 2), (size_t)(h * 2), 0x42475241 /* 'BGRA' */,
+                                (__bridge CFDictionaryRef)props, dispatch_get_main_queue(),
+                                ^(int32_t status, uint64_t displayTime, void *frameSurface, const void *updateRef) {
+        if (status == 0 /* a complete frame */ && frameSurface) {
+            gPreviewView.layer.contents = (__bridge id)frameSurface;
+        }
+    });
+    if (!stream || start(stream) != kCGErrorSuccess) {
+        fprintf(stderr, "[vdisplay] couldn't start the live preview\n");
+        return;
+    }
+    gStream = stream;
+    gPreview = window;
+    [window orderFrontRegardless];
+    fprintf(stderr, "[vdisplay] live preview started\n");
+
+    // The title says when your mouse pointer is on the TV screen
+    gPointerTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *timer) {
+        NSScreen *tv = screenForDisplay(gPreviewDisplay);
+        BOOL onTV = tv && NSPointInRect([NSEvent mouseLocation], tv.frame);
+        NSString *title = onTV ? @"TV screen (live) - your mouse pointer is on the TV"
+                               : @"TV screen (live) - click here to move the pointer to the TV";
+        if (![gPreview.title isEqualToString:title]) gPreview.title = title;
+    }];
+}
+
 // Creates the screen once macOS has finished starting us up as an app.
 @interface VDAppDelegate : NSObject <NSApplicationDelegate>
 @end
@@ -191,10 +337,17 @@ int main(int argc, const char *argv[]) {
         if (argc > 1) gWidth = (unsigned int)atoi(argv[1]);
         if (argc > 2) gHeight = (unsigned int)atoi(argv[2]);
         if (gWidth < 640 || gHeight < 480) { gWidth = 1920; gHeight = 1080; }
+        if (argc > 3 && strcmp(argv[3], "0") == 0) gWantPreview = NO;
 
         signal(SIGTERM, quit);
         signal(SIGINT, quit);
         signal(SIGHUP, quit);
+
+        // SIGUSR1 (TV Mirror's P key) shows/hides the live preview
+        signal(SIGUSR1, SIG_IGN);
+        gToggleSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGUSR1, 0, dispatch_get_main_queue());
+        dispatch_source_set_event_handler(gToggleSource, ^{ togglePreview(); });
+        dispatch_resume(gToggleSource);
 
         // Become a hidden background app so macOS connects us to the window server.
         [NSApplication sharedApplication];
