@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 APP_NAME = "TV Mirror"
-VERSION = "2.0"
+VERSION = "2.1"
 REPO = "nizarhalim05/tv-mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -927,6 +927,13 @@ static const int kMaxAttempts = 4;
 static BOOL gWantPreview = YES;
 
 static void createDisplay(void);
+static void createDisplaySoon(void);
+
+// macOS asks this program "the screens changed, OK?" while a screen is being added,
+// and only waits a quarter of a second for the answer, which comes from the main
+// thread. So the screen is created on this separate queue, keeping the main thread
+// free to answer (otherwise macOS can leave the new screen switched off).
+static dispatch_queue_t gWorkQueue;
 static void startPreview(CGDirectDisplayID displayID);
 
 static BOOL isOnline(CGDirectDisplayID displayID) {
@@ -989,10 +996,10 @@ static void waitUntilOnline(CGDirectDisplayID newID, int checks) {
     }
     // Remove it and try again as a "new" monitor
     gReplacing = YES;
-    gDisplay = nil;
+    dispatch_async(gWorkQueue, ^{ gDisplay = nil; });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC / 2), dispatch_get_main_queue(), ^{
         gReplacing = NO;
-        createDisplay();
+        createDisplaySoon();
     });
 }
 
@@ -1008,7 +1015,7 @@ static void createDisplay(void) {
     }
 
     CGVirtualDisplayDescriptor *descriptor = [[Descriptor alloc] init];
-    [descriptor setDispatchQueue:dispatch_get_main_queue()];
+    [descriptor setDispatchQueue:gWorkQueue];
     descriptor.name = @"TV Mirror Display";
     descriptor.maxPixelsWide = gWidth;
     descriptor.maxPixelsHigh = gHeight;
@@ -1036,7 +1043,12 @@ static void createDisplay(void) {
         exit(4);
     }
     gDisplay = display;
-    waitUntilOnline(display.displayID, 0);
+    CGDirectDisplayID newID = display.displayID;
+    dispatch_async(dispatch_get_main_queue(), ^{ waitUntilOnline(newID, 0); });
+}
+
+static void createDisplaySoon(void) {
+    dispatch_async(gWorkQueue, ^{ createDisplay(); });
 }
 
 // ---- Live preview -------------------------------------------------------------
@@ -1172,7 +1184,7 @@ static void startPreview(CGDirectDisplayID displayID) {
 @implementation VDAppDelegate
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC / 10), dispatch_get_main_queue(), ^{
-        createDisplay();
+        createDisplaySoon();
     });
 }
 @end
@@ -1186,6 +1198,7 @@ int main(int argc, const char *argv[]) {
         if (gWidth < 640 || gHeight < 480) { gWidth = 1920; gHeight = 1080; }
         if (argc > 3 && strcmp(argv[3], "0") == 0) gWantPreview = NO;
 
+        gWorkQueue = dispatch_queue_create("tvmirror.vdisplay", DISPATCH_QUEUE_SERIAL);
         signal(SIGTERM, quit);
         signal(SIGINT, quit);
         signal(SIGHUP, quit);
