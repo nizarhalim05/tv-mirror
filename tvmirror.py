@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 APP_NAME = "TV Mirror"
-VERSION = "2.1"
+VERSION = "2.2"
 REPO = "nizarhalim05/tv-mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -732,14 +732,20 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
         reason = "TV closed the connection"
         try:
             if probe:
-                # The end of the "file" doesn't exist yet. Give the TV empty packets,
-                # so it finds no timestamps there and treats the video as open-ended.
-                block = self.NULL_PACKET * 350
-                while sent < min(length, 4 * 1024 * 1024):
-                    part = block[:min(length, 4 * 1024 * 1024) - sent]
-                    self.wfile.write(part)
-                    sent += len(part)
-                reason = "sent filler for the peek"
+                # The TV peeks at "the end of the file" to work out how long the video is.
+                # Give it the newest real video (it needs real timestamps there: empty
+                # filler makes it say "Playback not available").
+                cap = min(length, 4 * 1024 * 1024)
+                pos = max(lf.start, lf.end - cap)
+                pos -= (pos - lf.start) % TS_PACKET
+                while sent < cap:
+                    data, used = lf.read(pos, min(256 * 1024, cap - sent), timeout=5)
+                    if not data:
+                        break
+                    self.wfile.write(data)
+                    sent += len(data)
+                    pos = used + len(data)
+                reason = "sent the newest video for the peek"
             else:
                 pos = start
                 while sent < length:
