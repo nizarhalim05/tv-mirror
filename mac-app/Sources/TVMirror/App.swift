@@ -1,4 +1,5 @@
 import AppKit
+import ScreenCaptureKit
 import SwiftUI
 import VirtualDisplay
 
@@ -227,6 +228,17 @@ final class AppModel: ObservableObject {
 
     private func start(tv: TV, displayID: CGDirectDisplayID, width: Int, height: Int, mode: Mode) async {
         busy = true
+        // macOS only checks Screen Recording permission when the app starts, so after
+        // allowing it the app has to be reopened.
+        if !CGPreflightScreenCaptureAccess() {
+            CGRequestScreenCaptureAccess()
+            virtualDisplay?.stop()
+            virtualDisplay = nil
+            status = "TV Mirror needs Screen Recording permission. Turn on TV Mirror in System Settings > "
+                + "Privacy & Security > Screen & System Audio Recording, then click Quit TV Mirror and open it again."
+            busy = false
+            return
+        }
         status = "Starting..."
         let session = MirrorSession(tv: tv, server: server, displayID: displayID, width: width, height: height)
         do {
@@ -238,14 +250,14 @@ final class AppModel: ObservableObject {
             await session.stop()
             virtualDisplay?.stop()
             virtualDisplay = nil
-            if "\(error)".lowercased().contains("declin") || "\(error)".lowercased().contains("permission")
-                || (error as NSError).domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain" {
-                status = "Allow Screen Recording for TV Mirror in System Settings, then try again."
+            if (error as? SCStreamError)?.code == .userDeclined {
+                status = "Screen Recording isn't allowed yet. Turn on TV Mirror in System Settings, then "
+                    + "click Quit TV Mirror and open it again."
                 if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
                     NSWorkspace.shared.open(url)
                 }
             } else {
-                status = "\(error)"
+                status = "Couldn't start: \(error.localizedDescription)"
             }
             Log.write("start failed: \(error)")
         }
