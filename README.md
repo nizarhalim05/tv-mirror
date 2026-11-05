@@ -214,6 +214,9 @@ Everything else uses Python's standard library plus ffmpeg.
 
 - A Mac running macOS 12 or later, with Apple's developer tools (the installer
   sets these up)
+- On macOS 13 or older (or if Homebrew can't install ffmpeg), the installer downloads
+  a ready-made ffmpeg from [ffmpeg.martin-riedl.de](https://ffmpeg.martin-riedl.de/)
+  into `~/tv-mirror/bin` instead
 - A smart TV with DLNA on the same network
 
 ## License

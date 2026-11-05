@@ -43,10 +43,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+
+# Use a ready-made ffmpeg in ~/tv-mirror/bin if the installer put one there
+_LOCAL_BIN = os.path.join(os.path.expanduser("~"), "tv-mirror", "bin")
+if os.path.isdir(_LOCAL_BIN):
+    os.environ["PATH"] = _LOCAL_BIN + os.pathsep + os.environ.get("PATH", "")
 from xml.sax.saxutils import escape
 
 APP_NAME = "TV Mirror"
-VERSION = "2.6"
+VERSION = "2.7"
 REPO = "nizarhalim05/tv-mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -1626,7 +1631,7 @@ def main():
     StreamHandler.dlna_pn = args.dlna_profile
 
     if not shutil.which("ffmpeg"):
-        print("ffmpeg is not installed. Install it with:  brew install ffmpeg")
+        print("ffmpeg is not installed. Run the installer again (see the GitHub page).")
         sys.exit(1)
 
     global HAS_DRAWTEXT, HAS_X264

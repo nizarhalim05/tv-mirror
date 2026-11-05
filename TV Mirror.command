@@ -1,5 +1,6 @@
 #!/bin/bash
 # Double-click this file to mirror your Mac to your TV. Close the window (or press Ctrl+C) to stop.
+export PATH="$HOME/tv-mirror/bin:$PATH"
 for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
   [[ -x "$b" ]] && eval "$("$b" shellenv)"
 done
