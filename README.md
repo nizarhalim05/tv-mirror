@@ -7,6 +7,36 @@ It works with TVs that support **DLNA** (most smart TVs since about 2012),
 including older Sony Bravia models that don't support AirPlay, such as the
 KDL-32WD754 (2016).
 
+## Easiest: the TV Mirror app (no Terminal)
+
+For Macs with Apple Silicon (M1 or newer) and macOS 13 or later.
+
+1. **Download** [TV-Mirror-Mac.zip](https://github.com/nizarhalim05/tv-mirror/releases/download/mac-app/TV-Mirror-Mac.zip).
+2. **Open** the downloaded zip (double-click it). A **TV Mirror** app appears.
+   Drag it into your **Applications** folder.
+3. **Open TV Mirror** (double-click it). The first time, macOS says it can't check
+   the app. Click **Done**, then open **System Settings > Privacy & Security**,
+   scroll down, click **Open Anyway** next to "TV Mirror", and enter your password.
+   This only happens once.
+4. A **TV icon** appears in the menu bar at the top right of your screen. Click it.
+5. Choose your TV, then click **Show my screen on the TV** or
+   **Use the TV as an extra screen**.
+6. **First time only:**
+   - If macOS asks to allow **Screen Recording**, turn on **TV Mirror** in
+     System Settings, then click the TV icon > **Quit TV Mirror** and open it again.
+   - If it asks to find devices on your **local network**, or to accept incoming
+     connections, click **Allow** (the TV needs this).
+7. **Extra screen:** when Apple's window asks how to use the new screen, choose
+   **Extend**. Click the TV icon > **Show mini screen** for the small live window.
+   Move a window to the TV with its green button > **Move to TV Mirror Display**.
+8. To stop, click the TV icon > **Stop**. If the TV falls behind, click
+   **Catch up**.
+
+The app is new. If it doesn't work for you, the Terminal version below still
+does, and the app's log is in `~/Library/Logs/TVMirror.log`.
+
+## Or: the Terminal version
+
 ## Install (one time)
 
 1. Turn on your TV and connect it to the **same Wi-Fi** as your Mac.
