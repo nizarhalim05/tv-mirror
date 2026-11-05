@@ -40,7 +40,55 @@ struct MenuContent: View {
             Button("Stop") { model.stop() }
         }
         Divider()
+        Button("Open TV Mirror window") { model.showWindow() }
         Button("Quit TV Mirror") { model.quit() }
+    }
+}
+
+/// The TV Mirror window (opens at launch, so it's obvious the app is running even when
+/// the menu bar is too full to show the icon).
+struct ControlPanel: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("TV Mirror").font(.title2).bold()
+            Text(model.status)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if model.tvs.isEmpty {
+                Text("No TV found yet")
+            } else {
+                Picker("TV", selection: $model.selectedName) {
+                    ForEach(model.tvs, id: \.name) { tv in Text(tv.name).tag(tv.name) }
+                }
+                .pickerStyle(.menu)
+            }
+            Button("Search for TVs again") { model.search() }
+            Divider()
+            Button("Show my screen on the TV") { model.showMyScreen() }
+                .disabled(model.selectedTV == nil || model.busy)
+            Button("Use the TV as an extra screen") { model.useExtraScreen() }
+                .disabled(model.selectedTV == nil || model.busy)
+            if model.mode == .extend {
+                Button(model.previewVisible ? "Hide mini screen" : "Show mini screen") { model.toggleMiniScreen() }
+            }
+            if model.isRunning {
+                HStack {
+                    Button("Catch up (if the TV falls behind)") { model.catchUp() }
+                    Button("Stop") { model.stop() }
+                }
+            }
+            Divider()
+            Text("TV Mirror also has a TV icon in the menu bar (top right). Closing this window "
+                 + "keeps it running; open TV Mirror again to bring the window back.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Quit TV Mirror") { model.quit() }
+        }
+        .padding(20)
+        .frame(width: 400)
     }
 }
 
@@ -59,11 +107,27 @@ final class AppModel: ObservableObject {
     private var session: MirrorSession?
     private var virtualDisplay: TVVirtualDisplay?
     private var preview: TVPreviewWindow?
+    private var window: NSWindow?
+    private static let showWindowNotice = Notification.Name("io.github.nizarhalim05.tvmirror.show")
 
     var isRunning: Bool { mode != nil }
     var selectedTV: TV? { tvs.first { $0.name == selectedName } ?? tvs.first }
 
     init() {
+        // Already running? Ask that copy to show its window, and quit this one.
+        let me = NSRunningApplication.current
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .filter { $0.processIdentifier != me.processIdentifier }
+        if !others.isEmpty {
+            DistributedNotificationCenter.default().postNotificationName(Self.showWindowNotice, object: nil,
+                                                                         userInfo: nil, deliverImmediately: true)
+            others.first?.activate(options: [])
+            exit(0)
+        }
+        DistributedNotificationCenter.default().addObserver(forName: Self.showWindowNotice, object: nil,
+                                                            queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.showWindow() }
+        }
         signal(SIGPIPE, SIG_IGN)
         do {
             try server.start()
@@ -71,6 +135,22 @@ final class AppModel: ObservableObject {
             status = "\(error)"
         }
         search()
+        DispatchQueue.main.async { self.showWindow() }
+    }
+
+    func showWindow() {
+        if window == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 420),
+                             styleMask: [.titled, .closable, .miniaturizable],
+                             backing: .buffered, defer: false)
+            w.title = "TV Mirror"
+            w.isReleasedWhenClosed = false
+            w.contentViewController = NSHostingController(rootView: ControlPanel(model: self))
+            w.center()
+            window = w
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
     }
 
     func search() {
