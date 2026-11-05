@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 APP_NAME = "TV Mirror"
-VERSION = "2.5"
+VERSION = "2.6"
 REPO = "nizarhalim05/tv-mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -1383,7 +1383,9 @@ def virtual_display_report(helper_lines, before, after):
         path = None
     for l in lines[1:1 + len(helper_lines or [1]) + 1]:
         print(l)
-    print("\nThis is usually a temporary macOS problem: restarting the Mac fixes it.")
+    print("\nmacOS only switches the extra screen on after you answer its window asking\n"
+          "how to use it. Try again, and choose EXTEND in Apple's window within 2 minutes\n"
+          "(it may be hiding behind other windows).")
     if path:
         print(f"(Full details saved in {path})")
 

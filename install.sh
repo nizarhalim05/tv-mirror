@@ -39,7 +39,15 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-# 4. The program and the Desktop launcher
+# 4. Apple's developer tools (to build the extra-screen helper)
+if ! xcode-select -p >/dev/null 2>&1; then
+  echo "Apple's developer tools are needed. A window will pop up: click Install,"
+  echo "wait for it to finish, then run this installer again."
+  xcode-select --install || true
+  exit 1
+fi
+
+# 5. The program and the Desktop launcher
 mkdir -p "$INSTALL_DIR"
 echo "Downloading TV Mirror..."
 curl -fsSL "$REPO_RAW/tvmirror.py" -o "$INSTALL_DIR/tvmirror.py"
