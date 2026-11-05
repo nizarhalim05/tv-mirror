@@ -22,6 +22,12 @@
 // up while running because newer macOS SDKs hide it; if it's missing, everything
 // else still works, just without the preview.
 //
+// Ticker mode (./vdisplay tick): shows a 2x2-pixel dot in the bottom-left corner
+// of every screen that changes by one shade of black 30 times a second. Recent macOS
+// only delivers a new frame to screen recording when something on screen changes, so
+// a still screen gave the TV ~2 frames a second, which made it buffer for a long time.
+// The dot keeps frames coming at full speed. You won't notice it.
+//
 // Build:  clang -fobjc-arc -framework AppKit -framework Foundation -framework CoreGraphics \
 //                -framework QuartzCore vdisplay.m -o vdisplay
 // Run:    ./vdisplay 1920 1080 1     (prints the screen's ID once it's on; last number:
@@ -79,6 +85,7 @@ static int gAttempt = 0;
 static BOOL gReplacing = NO;         // YES while we remove a screen on purpose
 static const int kMaxAttempts = 4;
 static BOOL gWantPreview = YES;
+static BOOL gTickMode = NO;
 
 static void createDisplay(void);
 static void createDisplaySoon(void);
@@ -331,12 +338,63 @@ static void startPreview(CGDirectDisplayID displayID) {
     }];
 }
 
+// ---- Ticker -------------------------------------------------------------------
+
+static NSMutableArray *gTickWindows;
+static NSUInteger gTickScreens = (NSUInteger)-1;
+static BOOL gTickPhase = NO;
+
+static void layoutTickers(void) {
+    NSArray *screens = [NSScreen screens];
+    if (screens.count == gTickScreens) return;
+    gTickScreens = screens.count;
+    for (NSWindow *w in gTickWindows) [w orderOut:nil];
+    [gTickWindows removeAllObjects];
+    for (NSScreen *screen in screens) {
+        NSRect f = screen.frame;
+        NSWindow *w = [[NSWindow alloc] initWithContentRect:NSMakeRect(f.origin.x, f.origin.y, 2, 2)
+                                                  styleMask:NSWindowStyleMaskBorderless
+                                                    backing:NSBackingStoreBuffered
+                                                      defer:NO];
+        w.releasedWhenClosed = NO;
+        w.ignoresMouseEvents = YES;
+        w.hasShadow = NO;
+        w.opaque = YES;
+        w.level = NSScreenSaverWindowLevel;
+        w.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                               NSWindowCollectionBehaviorStationary |
+                               NSWindowCollectionBehaviorFullScreenAuxiliary |
+                               NSWindowCollectionBehaviorIgnoresCycle;
+        w.backgroundColor = NSColor.blackColor;
+        [w setFrame:NSMakeRect(f.origin.x, f.origin.y, 2, 2) display:NO];
+        [w orderFrontRegardless];
+        [gTickWindows addObject:w];
+    }
+}
+
+static void startTicker(void) {
+    gTickWindows = [NSMutableArray array];
+    layoutTickers();
+    [NSTimer scheduledTimerWithTimeInterval:1.0 / 30.0 repeats:YES block:^(NSTimer *timer) {
+        gTickPhase = !gTickPhase;
+        NSColor *c = [NSColor colorWithSRGBRed:0 green:0 blue:(gTickPhase ? 1.0 / 255.0 : 0) alpha:1];
+        for (NSWindow *w in gTickWindows) w.backgroundColor = c;
+    }];
+    [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *timer) {
+        layoutTickers();                       // screens added or removed
+    }];
+}
+
 // Creates the screen once macOS has finished starting us up as an app.
 @interface VDAppDelegate : NSObject <NSApplicationDelegate>
 @end
 
 @implementation VDAppDelegate
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    if (gTickMode) {
+        startTicker();
+        return;
+    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC / 10), dispatch_get_main_queue(), ^{
         createDisplaySoon();
     });
@@ -347,7 +405,8 @@ static VDAppDelegate *gDelegate;     // NSApp only keeps a weak reference
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc > 1) gWidth = (unsigned int)atoi(argv[1]);
+        if (argc > 1 && strcmp(argv[1], "tick") == 0) gTickMode = YES;
+        else if (argc > 1) gWidth = (unsigned int)atoi(argv[1]);
         if (argc > 2) gHeight = (unsigned int)atoi(argv[2]);
         if (gWidth < 640 || gHeight < 480) { gWidth = 1920; gHeight = 1080; }
         if (argc > 3 && strcmp(argv[3], "0") == 0) gWantPreview = NO;
