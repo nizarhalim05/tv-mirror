@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build TV Mirror.app
+      - name: Build TellyBeam.app
         run: bash mac-app/build-app.sh
 
       - name: Publish the download
@@ -23,7 +23,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete mac-app --cleanup-tag --yes || true
-          gh release create mac-app "mac-app/build/TV-Mirror-Mac.zip" \
-            --title "TV Mirror for Mac (app)" \
+          gh release create mac-app "mac-app/build/TellyBeam-Mac.zip" \
+            --title "TellyBeam for Mac (app)" \
             --target "${{ github.sha }}" \
-            --notes "Download TV-Mirror-Mac.zip below, open it, and drag TV Mirror into your Applications folder. See the README for the first-time steps."
+            --notes "Download TellyBeam-Mac.zip below, open it, and drag TellyBeam into your Applications folder. See the README for the first-time steps."
