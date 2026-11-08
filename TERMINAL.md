@@ -1,4 +1,4 @@
-# TV Mirror: Terminal version
+# TellyBeam: Terminal version
 
 This is the original version. Works on macOS 12 and up, Intel or Apple Silicon.
 
@@ -14,13 +14,13 @@ This is the original version. Works on macOS 12 and up, Intel or Apple Silicon.
 
 4. If it asks for your password, type it (nothing shows while you type, that's normal)
 5. If a popup asks to install developer tools, click Install, wait, then run step 3 again
-6. When it says Done, there's a TV Mirror icon on your Desktop
+6. When it says Done, there's a TellyBeam icon on your Desktop
 
 On macOS 13 or older it downloads a ready-made ffmpeg from [ffmpeg.martin-riedl.de](https://ffmpeg.martin-riedl.de/) instead of using Homebrew, because Homebrew kept failing on old macOS.
 
 ## Using it
 
-Double-click **TV Mirror** on your Desktop, then:
+Double-click **TellyBeam** on your Desktop, then:
 
 - Type **1** to show your screen on the TV
 - Type **2** to use the TV as an extra screen. Apple will ask how to use the new display, pick **Extend**. You've got 2 minutes to answer
@@ -29,7 +29,7 @@ First time, macOS asks for Screen Recording. Turn on **Terminal** in System Sett
 
 ### Extra screen tips
 
-- Move a window to the TV: hover the green button > Move to TV Mirror Display
+- Move a window to the TV: hover the green button > Move to TellyBeam Display
 - Ctrl + Cmd + F makes it fullscreen on the TV. For YouTube just press F
 - For one browser tab: right-click the tab > Move Tab to New Window, then move that window
 - Your mouse goes off the right edge of your screen onto the TV
@@ -104,7 +104,7 @@ macOS doesn't let apps record system sound, so by default the TV gets silence. I
 
 ## Problems I ran into (and you might too)
 
-- **"Playback not available"**: TV Mirror checks if the TV actually starts downloading and tries other formats if not. It remembers what worked. You can also press F
+- **"Playback not available"**: TellyBeam checks if the TV actually starts downloading and tries other formats if not. It remembers what worked. You can also press F
 - **"No TV found"**: same Wi-Fi? Guest networks and some mesh routers block devices from seeing each other. On the Sony check Settings > Network > Home Network > Renderer is on. Restarting the TV fixes it more often than you'd think
 - **TV keeps connecting and disconnecting**: try `--encoder software`, then `--mode stream`
 - **"Couldn't create the invisible screen"**: you need to answer Apple's popup with Extend. It sometimes hides behind other windows. Details go in `~/.tv-mirror-build/virtual-screen-report.txt`

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TV Mirror - mirror your Mac's screen to a Sony TV (or most smart TVs) over Wi-Fi.
+TellyBeam - mirror your Mac's screen to a Sony TV (or most smart TVs) over Wi-Fi.
 
 How it works (same idea as AirBeamTV):
   1. ffmpeg captures the Mac screen and encodes it to H.264 video (hardware accelerated).
@@ -50,8 +50,8 @@ if os.path.isdir(_LOCAL_BIN):
     os.environ["PATH"] = _LOCAL_BIN + os.pathsep + os.environ.get("PATH", "")
 from xml.sax.saxutils import escape
 
-APP_NAME = "TV Mirror"
-VERSION = "2.7"
+APP_NAME = "TellyBeam"
+VERSION = "2.8"
 REPO = "nizarhalim05/tv-mirror"
 SSDP_ADDR = ("239.255.255.250", 1900)
 AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -861,7 +861,7 @@ VDISPLAY_SOURCE = r'''// vdisplay - creates an invisible extra screen ("virtual 
 //
 // macOS only draws the desktop you're looking at, so a desktop you've swiped away
 // from can't be recorded. A virtual display is a screen macOS *always* draws,
-// even though no real monitor is attached. TV Mirror records it and sends it to the TV.
+// even though no real monitor is attached. TellyBeam records it and sends it to the TV.
 //
 // It uses CGVirtualDisplay, a built-in but undocumented part of macOS's CoreGraphics
 // (the same thing apps like DeskPad use). macOS only switches a virtual screen on for
@@ -993,7 +993,7 @@ static void waitUntilOnline(CGDirectDisplayID newID, int checks) {
             }
         }
         report(newID);
-        printf("%u\n", newID);       // tell TV Mirror the screen is ready
+        printf("%u\n", newID);       // tell TellyBeam the screen is ready
         fflush(stdout);
         if (gWantPreview) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), dispatch_get_main_queue(), ^{
@@ -1037,7 +1037,7 @@ static void createDisplay(void) {
 
     CGVirtualDisplayDescriptor *descriptor = [[Descriptor alloc] init];
     [descriptor setDispatchQueue:gWorkQueue];
-    descriptor.name = @"TV Mirror Display";
+    descriptor.name = @"TellyBeam Display";
     descriptor.maxPixelsWide = gWidth;
     descriptor.maxPixelsHigh = gHeight;
     descriptor.sizeInMillimeters = CGSizeMake(gWidth * 0.37, gHeight * 0.37);  // like a ~32" TV
@@ -1276,7 +1276,7 @@ int main(int argc, const char *argv[]) {
         signal(SIGINT, quit);
         signal(SIGHUP, quit);
 
-        // SIGUSR1 (TV Mirror's P key) shows/hides the live preview
+        // SIGUSR1 (TellyBeam's P key) shows/hides the live preview
         signal(SIGUSR1, SIG_IGN);
         gToggleSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGUSR1, 0, dispatch_get_main_queue());
         dispatch_source_set_event_handler(gToggleSource, ^{ togglePreview(); });
@@ -1288,7 +1288,7 @@ int main(int argc, const char *argv[]) {
         gDelegate = [[VDAppDelegate alloc] init];
         [NSApp setDelegate:gDelegate];
 
-        // Keep running (and keep the screen alive) until TV Mirror stops us.
+        // Keep running (and keep the screen alive) until TellyBeam stops us.
         [NSApp run];
     }
     return 0;
@@ -1358,7 +1358,7 @@ def windowserver_log():
         out = subprocess.run(
             ["log", "show", "--last", "1m", "--info", "--style", "compact", "--predicate",
              'process == "WindowServer" AND (eventMessage CONTAINS[c] "virtual" '
-             'OR eventMessage CONTAINS[c] "display" OR eventMessage CONTAINS[c] "TV Mirror")'],
+             'OR eventMessage CONTAINS[c] "display" OR eventMessage CONTAINS[c] "TellyBeam")'],
             capture_output=True, text=True, timeout=45).stdout
     except Exception as e:
         return [f"(couldn't read the system log: {e})"]
@@ -1372,7 +1372,7 @@ def virtual_display_report(helper_lines, before, after):
     print("Reading the macOS system log to find out why (a few seconds)...")
     displays = subprocess.run("system_profiler SPDisplaysDataType | grep -E '^ {8}[^ ].*:$'",
                               shell=True, capture_output=True, text=True).stdout.strip()
-    lines = [f"TV Mirror {VERSION}, macOS {platform.mac_ver()[0]}, {time.strftime('%Y-%m-%d %H:%M:%S')}",
+    lines = [f"TellyBeam {VERSION}, macOS {platform.mac_ver()[0]}, {time.strftime('%Y-%m-%d %H:%M:%S')}",
              "Helper said:"] + ["  " + l for l in (helper_lines or ["(nothing)"])]
     lines += [f"Screens ffmpeg saw before: {sorted(before)}"]
     if after is not None:
@@ -1417,7 +1417,7 @@ def start_virtual_display(size, preview=True):
     if not exe:
         return None, None
 
-    # Close helpers left over from a TV Mirror that didn't shut down properly:
+    # Close helpers left over from a TellyBeam that didn't shut down properly:
     # their screens can stop macOS from switching a new one on.
     subprocess.run(["pkill", "-f", "/.tv-mirror-build/vdisplay-"], capture_output=True)
     time.sleep(0.5)
@@ -1572,7 +1572,7 @@ def self_update():
         f.write(new)
     os.replace(tmp, me)
     m = re.search(rb'VERSION = "([^"]+)"', new)
-    print(f"Updated TV Mirror {VERSION} -> {m.group(1).decode() if m else 'newest'}.")
+    print(f"Updated TellyBeam {VERSION} -> {m.group(1).decode() if m else 'newest'}.")
     return 0
 
 
@@ -1616,7 +1616,7 @@ def main():
     p.add_argument("--debug", action="store_true", help="print what the TV asks for")
     p.add_argument("--search-time", type=float, default=4.0, help="seconds to search for TVs")
     p.add_argument("--update", action="store_true", help="download the newest version from GitHub")
-    p.add_argument("--version", action="version", version=f"TV Mirror {VERSION}")
+    p.add_argument("--version", action="version", version=f"TellyBeam {VERSION}")
     p.add_argument("--list-devices", action="store_true", help="list screens and audio devices, then exit")
     p.add_argument("--serve-only", action="store_true", help="don't control a TV; just serve the stream")
     p.add_argument("--test-pattern", action="store_true", help="send a test picture instead of your screen")
@@ -1624,7 +1624,7 @@ def main():
 
     if args.update:
         sys.exit(self_update())
-    print(f"TV Mirror {VERSION}")
+    print(f"TellyBeam {VERSION}")
 
     StreamHandler.mode = args.mode
     StreamHandler.debug = args.debug
@@ -1680,7 +1680,7 @@ def main():
         else:
             atexit.register(lambda: vd_proc.poll() is None and vd_proc.terminate())
             args.screen = vd_screen
-            print("\nAdded an invisible screen called 'TV Mirror Display'. Whatever is on it goes\n"
+            print("\nAdded an invisible screen called 'TellyBeam Display'. Whatever is on it goes\n"
                   "to the TV, while you keep working on your normal screen and desktops.\n")
             if not args.no_preview:
                 print("A small window called 'TV screen (live)' shows that screen on your Mac with no\n"
@@ -1688,8 +1688,8 @@ def main():
                       "right edge of your screen) to drag or resize windows there. Click a spot in it\n"
                       "to make your pointer jump there. Press P to show/hide it.\n")
             print("To put a window on the TV: hover over its green button and choose\n"
-                  "'Move to TV Mirror Display'. To make it fill the TV, press Ctrl+Cmd+F straight\n"
-                  "after. When TV Mirror quits, the screen disappears and its windows come back.\n")
+                  "'Move to TellyBeam Display'. To make it fill the TV, press Ctrl+Cmd+F straight\n"
+                  "after. When TellyBeam quits, the screen disappears and its windows come back.\n")
 
     if not args.test_pattern:
         args.screen = choose_screen(args.screen)
@@ -1788,7 +1788,7 @@ def main():
         if not args.test_pattern and args.screen.startswith("Capture screen "):
             what = f"screen {int(args.screen.split()[-1]) + 1}"
         if vd_screen and args.screen == vd_screen:
-            what += " (TV Mirror Display)"
+            what += " (TellyBeam Display)"
         label = next((p[2] for p in PROFILES if (p[0], p[1]) == (args.encoder, args.audio_codec)),
                      f"{args.encoder} video + {args.audio_codec.upper()} sound")
         log(f"  Now showing: {what}  |  {args.rate:g} Mbit/s  |  {label}  |  mode: {StreamHandler.mode}")

@@ -1,5 +1,5 @@
 #!/bin/bash
-# TV Mirror installer: sets up everything needed and puts a "TV Mirror" launcher on your Desktop.
+# TellyBeam installer: sets up everything needed and puts a "TellyBeam" launcher on your Desktop.
 set -e
 
 REPO_RAW="https://raw.githubusercontent.com/nizarhalim05/tv-mirror/main"
@@ -9,7 +9,7 @@ BIN_DIR="$INSTALL_DIR/bin"
 FFMPEG_ZIP_ARM="https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip"
 FFMPEG_ZIP_INTEL="https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/release/ffmpeg.zip"
 
-echo "== TV Mirror installer =="
+echo "== TellyBeam installer =="
 
 if [[ "$(uname)" != "Darwin" ]]; then
   echo "This only works on a Mac."; exit 1
@@ -62,7 +62,7 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   fi
 fi
 if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx264; then
-  echo "Note: this ffmpeg has no x264 encoder, so TV Mirror will use the Mac's video chip."
+  echo "Note: this ffmpeg has no x264 encoder, so TellyBeam will use the Mac's video chip."
 fi
 
 # 2. Python 3 and Apple's developer tools (to build the extra-screen helper)
@@ -75,11 +75,11 @@ fi
 
 # 3. The program and the Desktop launcher
 mkdir -p "$INSTALL_DIR"
-echo "Downloading TV Mirror..."
+echo "Downloading TellyBeam..."
 curl -fsSL "$REPO_RAW/tvmirror.py" -o "$INSTALL_DIR/tvmirror.py"
-curl -fsSL "$REPO_RAW/TV%20Mirror.command" -o "$HOME/Desktop/TV Mirror.command"
-chmod +x "$HOME/Desktop/TV Mirror.command"
+curl -fsSL "$REPO_RAW/TV%20Mirror.command" -o "$HOME/Desktop/TellyBeam.command"
+chmod +x "$HOME/Desktop/TellyBeam.command"
 
 echo
-echo "Done! Double-click 'TV Mirror' on your Desktop to start mirroring."
+echo "Done! Double-click 'TellyBeam' on your Desktop to start mirroring."
 echo "(The first time, allow Screen Recording for Terminal in System Settings.)"

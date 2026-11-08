@@ -3,7 +3,7 @@
 //
 // macOS only draws the desktop you're looking at, so a desktop you've swiped away
 // from can't be recorded. A virtual display is a screen macOS *always* draws,
-// even though no real monitor is attached. TV Mirror records it and sends it to the TV.
+// even though no real monitor is attached. TellyBeam records it and sends it to the TV.
 //
 // It uses CGVirtualDisplay, a built-in but undocumented part of macOS's CoreGraphics
 // (the same thing apps like DeskPad use). macOS only switches a virtual screen on for
@@ -135,7 +135,7 @@ static void waitUntilOnline(CGDirectDisplayID newID, int checks) {
             }
         }
         report(newID);
-        printf("%u\n", newID);       // tell TV Mirror the screen is ready
+        printf("%u\n", newID);       // tell TellyBeam the screen is ready
         fflush(stdout);
         if (gWantPreview) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), dispatch_get_main_queue(), ^{
@@ -179,7 +179,7 @@ static void createDisplay(void) {
 
     CGVirtualDisplayDescriptor *descriptor = [[Descriptor alloc] init];
     [descriptor setDispatchQueue:gWorkQueue];
-    descriptor.name = @"TV Mirror Display";
+    descriptor.name = @"TellyBeam Display";
     descriptor.maxPixelsWide = gWidth;
     descriptor.maxPixelsHigh = gHeight;
     descriptor.sizeInMillimeters = CGSizeMake(gWidth * 0.37, gHeight * 0.37);  // like a ~32" TV
@@ -418,7 +418,7 @@ int main(int argc, const char *argv[]) {
         signal(SIGINT, quit);
         signal(SIGHUP, quit);
 
-        // SIGUSR1 (TV Mirror's P key) shows/hides the live preview
+        // SIGUSR1 (TellyBeam's P key) shows/hides the live preview
         signal(SIGUSR1, SIG_IGN);
         gToggleSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGUSR1, 0, dispatch_get_main_queue());
         dispatch_source_set_event_handler(gToggleSource, ^{ togglePreview(); });
@@ -430,7 +430,7 @@ int main(int argc, const char *argv[]) {
         gDelegate = [[VDAppDelegate alloc] init];
         [NSApp setDelegate:gDelegate];
 
-        // Keep running (and keep the screen alive) until TV Mirror stops us.
+        // Keep running (and keep the screen alive) until TellyBeam stops us.
         [NSApp run];
     }
     return 0;
