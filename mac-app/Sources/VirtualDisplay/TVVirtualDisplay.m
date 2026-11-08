@@ -79,7 +79,7 @@ static BOOL TVDisplayIsOnline(CGDirectDisplayID displayID) {
     }
     CGVirtualDisplayDescriptor *descriptor = [[Descriptor alloc] init];
     [descriptor setDispatchQueue:_queue];
-    descriptor.name = @"TV Mirror Display";
+    descriptor.name = @"TellyBeam Display";
     descriptor.maxPixelsWide = _width;
     descriptor.maxPixelsHigh = _height;
     descriptor.sizeInMillimeters = CGSizeMake(_width * 0.37, _height * 0.37);  // like a ~32" TV
