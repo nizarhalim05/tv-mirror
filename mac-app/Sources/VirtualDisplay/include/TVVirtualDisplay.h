@@ -3,7 +3,7 @@
 NS_ASSUME_NONNULL_BEGIN
 
 /// An invisible extra screen ("virtual display") that macOS always draws, even when
-/// you're on another desktop. TV Mirror records it and sends it to the TV.
+/// you're on another desktop. TellyBeam records it and sends it to the TV.
 @interface TVVirtualDisplay : NSObject
 
 - (instancetype)initWithWidth:(unsigned)width height:(unsigned)height;
