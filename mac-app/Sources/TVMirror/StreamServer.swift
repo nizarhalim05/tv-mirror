@@ -148,7 +148,7 @@ final class StreamServer {
         }
         guard bound == 0, listen(fd, 16) == 0 else {
             close(fd)
-            throw Discovery.TVError(description: "Port \(port) is in use (is another TV Mirror running?).")
+            throw Discovery.TVError(description: "Port \(port) is in use (is another TellyBeam running?).")
         }
         Thread.detachNewThread { [weak self] in
             while true {

@@ -124,7 +124,7 @@ enum Discovery {
         let metadata = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" "
             + "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
             + "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">"
-            + "<item id=\"0\" parentID=\"-1\" restricted=\"1\"><dc:title>TV Mirror</dc:title>"
+            + "<item id=\"0\" parentID=\"-1\" restricted=\"1\"><dc:title>TellyBeam</dc:title>"
             + "<upnp:class>object.item.videoItem</upnp:class>"
             + "<res protocolInfo=\"\(protocolInfo)\">\(escape(url))</res></item></DIDL-Lite>"
         try soap(tv, "SetAVTransportURI", [("InstanceID", "0"), ("CurrentURI", url),

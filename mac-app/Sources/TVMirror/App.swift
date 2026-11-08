@@ -8,7 +8,7 @@ struct TVMirrorApp: App {
     @StateObject private var model = AppModel()
 
     var body: some Scene {
-        MenuBarExtra("TV Mirror", systemImage: model.isRunning ? "tv.fill" : "tv") {
+        MenuBarExtra("TellyBeam", systemImage: model.isRunning ? "tv.fill" : "tv") {
             MenuContent(model: model)
         }
     }
@@ -41,19 +41,19 @@ struct MenuContent: View {
             Button("Stop") { model.stop() }
         }
         Divider()
-        Button("Open TV Mirror window") { model.showWindow() }
-        Button("Quit TV Mirror") { model.quit() }
+        Button("Open TellyBeam window") { model.showWindow() }
+        Button("Quit TellyBeam") { model.quit() }
     }
 }
 
-/// The TV Mirror window (opens at launch, so it's obvious the app is running even when
+/// The TellyBeam window (opens at launch, so it's obvious the app is running even when
 /// the menu bar is too full to show the icon).
 struct ControlPanel: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("TV Mirror").font(.title2).bold()
+            Text("TellyBeam").font(.title2).bold()
             Text(model.status)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -81,12 +81,12 @@ struct ControlPanel: View {
                 }
             }
             Divider()
-            Text("TV Mirror also has a TV icon in the menu bar (top right). Closing this window "
-                 + "keeps it running; open TV Mirror again to bring the window back.")
+            Text("TellyBeam also has a TV icon in the menu bar (top right). Closing this window "
+                 + "keeps it running; open TellyBeam again to bring the window back.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Button("Quit TV Mirror") { model.quit() }
+            Button("Quit TellyBeam") { model.quit() }
         }
         .padding(20)
         .frame(width: 400)
@@ -144,7 +144,7 @@ final class AppModel: ObservableObject {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 420),
                              styleMask: [.titled, .closable, .miniaturizable],
                              backing: .buffered, defer: false)
-            w.title = "TV Mirror"
+            w.title = "TellyBeam"
             w.isReleasedWhenClosed = false
             w.contentViewController = NSHostingController(rootView: ControlPanel(model: self))
             w.center()
@@ -212,7 +212,7 @@ final class AppModel: ObservableObject {
                     self.previewVisible = preview.start()
                     self.preview = preview
                     self.status = "Showing the extra screen on \(tv.name). Move a window there with its "
-                        + "green button > Move to TV Mirror Display."
+                        + "green button > Move to TellyBeam Display."
                 }
             }
         }
@@ -234,8 +234,8 @@ final class AppModel: ObservableObject {
             CGRequestScreenCaptureAccess()
             virtualDisplay?.stop()
             virtualDisplay = nil
-            status = "TV Mirror needs Screen Recording permission. Turn on TV Mirror in System Settings > "
-                + "Privacy & Security > Screen & System Audio Recording, then click Quit TV Mirror and open it again."
+            status = "TellyBeam needs Screen Recording permission. Turn on TellyBeam in System Settings > "
+                + "Privacy & Security > Screen & System Audio Recording, then click Quit TellyBeam and open it again."
             busy = false
             return
         }
@@ -251,8 +251,8 @@ final class AppModel: ObservableObject {
             virtualDisplay?.stop()
             virtualDisplay = nil
             if (error as? SCStreamError)?.code == .userDeclined {
-                status = "Screen Recording isn't allowed yet. Turn on TV Mirror in System Settings, then "
-                    + "click Quit TV Mirror and open it again."
+                status = "Screen Recording isn't allowed yet. Turn on TellyBeam in System Settings, then "
+                    + "click Quit TellyBeam and open it again."
                 if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
                     NSWorkspace.shared.open(url)
                 }
