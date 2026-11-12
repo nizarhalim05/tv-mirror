@@ -31,7 +31,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (instancetype)initWithDisplayID:(uint32_t)displayID width:(unsigned)width height:(unsigned)height;
 - (BOOL)start;
 /// Shows one recorded picture. Call on the main thread.
-- (void)showSurface:(IOSurfaceRef)surface;
+- (void)showSurface:(IOSurfaceRef)surface NS_SWIFT_NAME(showSurface(_:));
 - (void)show;
 - (void)hide;
 - (void)stop;
