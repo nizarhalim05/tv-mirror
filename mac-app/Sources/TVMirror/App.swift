@@ -1,4 +1,5 @@
 import AppKit
+import CoreVideo
 import ScreenCaptureKit
 import SwiftUI
 import VirtualDisplay
@@ -40,6 +41,12 @@ struct MenuContent: View {
             Button("Catch up (if the TV falls behind)") { model.catchUp() }
             Button("Stop") { model.stop() }
         }
+        if model.needsPermission {
+            Divider()
+            Button("Open Screen Recording settings") { model.openScreenRecordingSettings() }
+            Button("Restart TellyBeam") { model.restart() }
+            Button("Reset permission (if it keeps asking)") { model.resetPermission() }
+        }
         Divider()
         Button("Open TellyBeam window") { model.showWindow() }
         Button("Quit TellyBeam") { model.quit() }
@@ -80,6 +87,21 @@ struct ControlPanel: View {
                     Button("Stop") { model.stop() }
                 }
             }
+            if model.needsPermission {
+                Divider()
+                Text("Screen Recording permission").bold()
+                Text("1. Turn on TellyBeam in Screen & System Audio Recording.\n"
+                     + "2. Click Restart TellyBeam (closing the window isn't enough).\n"
+                     + "Still asking after that? Click Reset permission, allow it once more, then restart.")
+                    .font(.footnote)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button("Open Settings") { model.openScreenRecordingSettings() }
+                    Button("Restart TellyBeam") { model.restart() }
+                        .keyboardShortcut(.defaultAction)
+                    Button("Reset permission") { model.resetPermission() }
+                }
+            }
             Divider()
             Text("TellyBeam also has a TV icon in the menu bar (top right). Closing this window "
                  + "keeps it running; open TellyBeam again to bring the window back.")
@@ -103,12 +125,15 @@ final class AppModel: ObservableObject {
     @Published var mode: Mode?
     @Published var previewVisible = false
     @Published var busy = false
+    @Published var needsPermission = false
 
     private let server = StreamServer()
     private var session: MirrorSession?
     private var virtualDisplay: TVVirtualDisplay?
     private var preview: TVPreviewWindow?
     private var window: NSWindow?
+    private var watchdog: Task<Void, Never>?
+    private var askedForPermission = false     // macOS's own prompt only once per launch
     private static let showWindowNotice = Notification.Name("io.github.nizarhalim05.tvmirror.show")
 
     var isRunning: Bool { mode != nil }
@@ -178,12 +203,14 @@ final class AppModel: ObservableObject {
         guard let tv = selectedTV else { return }
         Task {
             await stopEverything()
+            guard await checkPermission() else { return }
             let display = CGMainDisplayID()
             let bounds = CGDisplayBounds(display)
             let height = 1080
             var width = Int((Double(height) * bounds.width / max(bounds.height, 1)).rounded())
             width -= width % 2
-            await start(tv: tv, displayID: display, width: width, height: height, mode: .mirror)
+            await start(tv: tv, displayID: display, width: width, height: height, mode: .mirror,
+                        success: "Showing your screen on \(tv.name)")
         }
     }
 
@@ -193,6 +220,8 @@ final class AppModel: ObservableObject {
         guard let tv = selectedTV else { return }
         Task {
             await stopEverything()
+            // Check before creating the screen, so it doesn't appear and vanish again
+            guard await checkPermission() else { return }
             busy = true
             status = "Creating the extra screen... If macOS asks how to use it, choose Extend."
             let display = TVVirtualDisplay(width: 1920, height: 1080)
@@ -204,15 +233,22 @@ final class AppModel: ObservableObject {
                         self.busy = false
                         self.virtualDisplay = nil
                         self.status = message ?? "Couldn't create the extra screen."
+                        Log.write("extra screen failed: \(message ?? "-")")
                         return
                     }
-                    await self.start(tv: tv, displayID: displayID, width: 1920, height: 1080, mode: .extend)
-                    guard self.mode == .extend else { return }
+                    Log.write("extra screen online: \(displayID)")
+                    let success = "Showing the extra screen on \(tv.name). Move a window there with its "
+                        + "green button > Move to TellyBeam Display."
+                    guard await self.start(tv: tv, displayID: displayID, width: 1920, height: 1080,
+                                           mode: .extend, success: success),
+                          let session = self.session else { return }
                     let preview = TVPreviewWindow(displayID: displayID, width: 1920, height: 1080)
                     self.previewVisible = preview.start()
                     self.preview = preview
-                    self.status = "Showing the extra screen on \(tv.name). Move a window there with its "
-                        + "green button > Move to TellyBeam Display."
+                    session.onPreviewFrame = { [weak preview] pixels in
+                        guard let surface = CVPixelBufferGetIOSurface(pixels)?.takeUnretainedValue() else { return }
+                        DispatchQueue.main.async { preview?.showSurface(surface) }
+                    }
                 }
             }
         }
@@ -226,42 +262,151 @@ final class AppModel: ObservableObject {
 
     // MARK: Running
 
-    private func start(tv: TV, displayID: CGDirectDisplayID, width: Int, height: Int, mode: Mode) async {
+    /// Starts recording and tells the TV to play. Returns false if it didn't start.
+    @discardableResult
+    private func start(tv: TV, displayID: CGDirectDisplayID, width: Int, height: Int, mode: Mode,
+                       success: String) async -> Bool {
         busy = true
-        // macOS only checks Screen Recording permission when the app starts, so after
-        // allowing it the app has to be reopened.
-        if !CGPreflightScreenCaptureAccess() {
-            CGRequestScreenCaptureAccess()
-            virtualDisplay?.stop()
-            virtualDisplay = nil
-            status = "TellyBeam needs Screen Recording permission. Turn on TellyBeam in System Settings > "
-                + "Privacy & Security > Screen & System Audio Recording, then click Quit TellyBeam and open it again."
-            busy = false
-            return
-        }
         status = "Starting..."
         let session = MirrorSession(tv: tv, server: server, displayID: displayID, width: width, height: height)
         do {
             try await session.start()
-            self.session = session
-            self.mode = mode
-            status = "Showing \(mode == .mirror ? "your screen" : "the extra screen") on \(tv.name)"
         } catch {
             await session.stop()
             virtualDisplay?.stop()
             virtualDisplay = nil
-            if (error as? SCStreamError)?.code == .userDeclined {
-                status = "Screen Recording isn't allowed yet. Turn on TellyBeam in System Settings, then "
-                    + "click Quit TellyBeam and open it again."
-                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
-                    NSWorkspace.shared.open(url)
-                }
-            } else {
-                status = "Couldn't start: \(error.localizedDescription)"
-            }
+            busy = false
             Log.write("start failed: \(error)")
+            if error is ScreenPermissionError {
+                askForPermission()
+            } else {
+                let reason = error is Discovery.TVError ? String(describing: error) : error.localizedDescription
+                status = "Couldn't start: \(reason)"
+            }
+            return false
         }
+        self.session = session
+        self.mode = mode
+        needsPermission = false
         busy = false
+        status = "Connecting to \(tv.name)... the TV takes a few seconds to start."
+        watch(session, tv: tv, success: success)
+        return true
+    }
+
+    /// Only says "Showing" once the TV is really downloading the picture, and explains
+    /// what's wrong when macOS sends no picture or the TV never asks for it.
+    private func watch(_ session: MirrorSession, tv: TV, success: String) {
+        watchdog?.cancel()
+        let startBytes = server.deliveredBytes
+        watchdog = Task { [weak self] in
+            var waited = 0.0
+            var warnedNoPicture = false
+            while !Task.isCancelled && waited < 30 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                waited += 0.5
+                guard let self, self.session === session else { return }
+                let frames = session.framesRecorded
+                let bytes = self.server.deliveredBytes - startBytes
+                if frames > 0 && bytes > 0 {
+                    Log.write("TV is downloading: \(bytes) bytes after \(waited) s, \(frames) pictures")
+                    self.status = success
+                    return
+                }
+                if frames == 0 && waited >= 4 && !warnedNoPicture {
+                    warnedNoPicture = true
+                    Log.write("no pictures from macOS after \(waited) s")
+                    self.needsPermission = true
+                    self.status = "macOS isn't giving TellyBeam any picture, so the TV will stay blank. "
+                        + "This usually means Screen Recording is blocked: click Reset permission, allow "
+                        + "TellyBeam again, then click Restart TellyBeam."
+                }
+            }
+            guard let self, !Task.isCancelled, self.session === session else { return }
+            let frames = session.framesRecorded
+            Log.write("after 30 s: \(frames) pictures, TV downloaded \(self.server.deliveredBytes - startBytes) bytes")
+            if frames == 0 { return }    // already explained above
+            self.status = "\(tv.name) hasn't fetched the picture. Check the TV is on the same Wi-Fi and "
+                + "not showing an error, then click Catch up. If your Mac's firewall is on, allow "
+                + "TellyBeam to accept incoming connections (System Settings > Network > Firewall)."
+        }
+    }
+
+    // MARK: Screen Recording permission
+
+    /// True if TellyBeam can record now. Otherwise explains what to do.
+    private func checkPermission() async -> Bool {
+        if await ScreenSource.canRecord() {
+            needsPermission = false
+            return true
+        }
+        Log.write("screen recording not allowed (preflight says \(CGPreflightScreenCaptureAccess()))")
+        askForPermission()
+        return false
+    }
+
+    private func askForPermission() {
+        needsPermission = true
+        if !askedForPermission {
+            // macOS's own "allow screen recording" message. It only appears once, so the
+            // next time the Settings page is opened directly instead of asking again.
+            askedForPermission = true
+            CGRequestScreenCaptureAccess()
+        } else {
+            openScreenRecordingSettings()
+        }
+        status = "TellyBeam needs Screen Recording permission. Turn on TellyBeam in System Settings > "
+            + "Privacy & Security > Screen & System Audio Recording, then click Restart TellyBeam."
+        showWindow()
+    }
+
+    func openScreenRecordingSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Quits and opens TellyBeam again: macOS only applies a new Screen Recording
+    /// permission to a freshly started app. (Opening TellyBeam while it's still running
+    /// just brings back this copy, which is why "quit and reopen" often didn't work.)
+    func restart() {
+        Task {
+            await stopEverything()
+            let relaunch = Process()
+            relaunch.executableURL = URL(fileURLWithPath: "/bin/sh")
+            relaunch.arguments = ["-c", "while /bin/kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"$2\"",
+                                  "sh", String(ProcessInfo.processInfo.processIdentifier), Bundle.main.bundlePath]
+            do {
+                try relaunch.run()
+            } catch {
+                status = "Couldn't restart by itself. Click Quit TellyBeam, then open it again."
+                return
+            }
+            Log.write("restarting")
+            NSApplication.shared.terminate(nil)
+        }
+    }
+
+    /// Clears TellyBeam's Screen Recording entry. Needed when System Settings shows TellyBeam
+    /// switched on but macOS still says no: the entry belongs to an older download of the
+    /// app (each new build has a new signature), so switching it on does nothing.
+    func resetPermission() {
+        let reset = Process()
+        reset.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        reset.arguments = ["reset", "ScreenCapture", Bundle.main.bundleIdentifier ?? "io.github.nizarhalim05.tvmirror"]
+        do {
+            try reset.run()
+            reset.waitUntilExit()
+            Log.write("tccutil reset ScreenCapture: \(reset.terminationStatus)")
+        } catch {
+            Log.write("tccutil failed: \(error)")
+        }
+        needsPermission = true
+        askedForPermission = true
+        CGRequestScreenCaptureAccess()
+        openScreenRecordingSettings()
+        status = "Permission cleared. Turn on TellyBeam in the Settings window (add it with + if it's not "
+            + "listed), then click Restart TellyBeam."
     }
 
     func catchUp() {
@@ -276,6 +421,9 @@ final class AppModel: ObservableObject {
     }
 
     private func stopEverything() async {
+        watchdog?.cancel()
+        watchdog = nil
+        session?.onPreviewFrame = nil
         preview?.stop()
         preview = nil
         previewVisible = false

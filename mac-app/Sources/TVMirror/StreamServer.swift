@@ -89,7 +89,13 @@ final class StreamServer {
     private let lock = NSLock()
     private var file: LiveFile?
     private var generation = 0
-    private(set) var delivered = 0
+    private var delivered = 0
+
+    /// Bytes of video the TV has downloaded so far (0 = the TV never fetched the picture).
+    var deliveredBytes: Int {
+        lock.lock(); defer { lock.unlock() }
+        return delivered
+    }
     private static let fakeLength = 100 * 1024 * 1024 * 1024    // "a very long video" (100 GB)
     private static let features = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 

@@ -21,8 +21,13 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
-# "Ad-hoc" signature: free, but macOS asks people to allow the app the first time
-codesign --force --deep --sign - "$APP"
+# Signature. With SIGN_IDENTITY set (the CI does this when the signing certificate is in
+# the repo secrets, see make-signing-cert.sh), every build has the same signature, so
+# macOS keeps the Screen Recording permission when people update TellyBeam.
+# Without it: an "ad-hoc" signature, which is free but different on every build, so after
+# each update macOS forgets the permission (Reset permission in the app fixes that).
+codesign --force --deep --sign "${SIGN_IDENTITY:--}" "$APP"
+codesign --display --requirements - "$APP" 2>&1 | tail -1
 
 cd build
 ditto -c -k --keepParent "TellyBeam.app" "TellyBeam-Mac.zip"

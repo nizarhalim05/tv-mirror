@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
     paths: ["mac-app/**", ".github/workflows/mac-app.yml"]
+  pull_request:
+    paths: ["mac-app/**", ".github/workflows/mac-app.yml"]
   workflow_dispatch:
 
 permissions:
@@ -15,10 +17,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Optional: the same signature on every build, so Macs keep the Screen Recording
+      # permission after an update. Set up with mac-app/make-signing-cert.sh.
+      - name: Load the signing certificate
+        if: github.event_name != 'pull_request'
+        env:
+          P12: ${{ secrets.MAC_SIGNING_P12 }}
+          PASSWORD: ${{ secrets.MAC_SIGNING_PASSWORD }}
+        run: |
+          if [ -z "$P12" ]; then
+            echo "No MAC_SIGNING_P12 secret: using an ad-hoc signature."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p ci "$KEYCHAIN"
+          security set-keychain-settings "$KEYCHAIN"
+          security unlock-keychain -p ci "$KEYCHAIN"
+          security import "$RUNNER_TEMP/signing.p12" -k "$KEYCHAIN" -P "$PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          # A self-made certificate has to be trusted for code signing on this machine
+          openssl pkcs12 -in "$RUNNER_TEMP/signing.p12" -nokeys -passin "pass:$PASSWORD" -legacy \
+              -out "$RUNNER_TEMP/cert.pem" 2>/dev/null \
+            || openssl pkcs12 -in "$RUNNER_TEMP/signing.p12" -nokeys -passin "pass:$PASSWORD" \
+              -out "$RUNNER_TEMP/cert.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$RUNNER_TEMP/cert.pem"
+          echo "SIGN_IDENTITY=TellyBeam Signing" >> "$GITHUB_ENV"
+
       - name: Build TellyBeam.app
         run: bash mac-app/build-app.sh
 
       - name: Publish the download
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
