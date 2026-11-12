@@ -1,10 +1,9 @@
-// The invisible extra screen and the mini screen, using macOS's built-in (undocumented)
-// CGVirtualDisplay and CGDisplayStream. Same approach as vdisplay.m in the Terminal version.
+// The invisible extra screen (macOS's built-in, undocumented CGVirtualDisplay) and the
+// mini screen. Same approach as vdisplay.m in the Terminal version.
 
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
-#include <dlfcn.h>
 #include <math.h>
 #import "TVVirtualDisplay.h"
 
@@ -164,14 +163,6 @@ static BOOL TVDisplayIsOnline(CGDirectDisplayID displayID) {
 
 // ---- The mini screen -------------------------------------------------------------
 
-typedef void *TVStreamRef;
-typedef void (^TVFrameHandler)(int32_t status, uint64_t displayTime, void *frameSurface, const void *updateRef);
-typedef TVStreamRef (*TVStreamCreateFn)(CGDirectDisplayID display, size_t outputWidth, size_t outputHeight,
-                                        int32_t pixelFormat, CFDictionaryRef properties,
-                                        dispatch_queue_t queue, TVFrameHandler handler);
-typedef CGError (*TVStreamStartFn)(TVStreamRef stream);
-typedef CGError (*TVStreamStopFn)(TVStreamRef stream);
-
 @interface TVPreviewView : NSView
 @property (nonatomic) CGDirectDisplayID targetDisplay;
 @end
@@ -196,7 +187,6 @@ typedef CGError (*TVStreamStopFn)(TVStreamRef stream);
     unsigned _width, _height;
     NSWindow *_window;
     TVPreviewView *_view;
-    TVStreamRef _stream;
     NSTimer *_timer;
 }
 
@@ -212,11 +202,6 @@ typedef CGError (*TVStreamStopFn)(TVStreamRef stream);
 - (BOOL)isVisible { return _window.visible; }
 
 - (BOOL)start {
-    // Looked up while running: newer macOS SDKs hide CGDisplayStream
-    TVStreamCreateFn create = (TVStreamCreateFn)dlsym(RTLD_DEFAULT, "CGDisplayStreamCreateWithDispatchQueue");
-    TVStreamStartFn start = (TVStreamStartFn)dlsym(RTLD_DEFAULT, "CGDisplayStreamStart");
-    if (!create || !start) return NO;
-
     NSScreen *home = nil;   // one of your real screens
     for (NSScreen *screen in [NSScreen screens]) {
         NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
@@ -246,22 +231,6 @@ typedef CGError (*TVStreamStopFn)(TVStreamRef stream);
     _view.layer.contentsGravity = kCAGravityResizeAspect;
     _window.contentView = _view;
 
-    NSMutableDictionary *props = [NSMutableDictionary dictionary];
-    CFStringRef *showCursor = (CFStringRef *)dlsym(RTLD_DEFAULT, "kCGDisplayStreamShowCursor");
-    CFStringRef *minFrameTime = (CFStringRef *)dlsym(RTLD_DEFAULT, "kCGDisplayStreamMinimumFrameTime");
-    if (showCursor && *showCursor) props[(__bridge NSString *)*showCursor] = @YES;
-    if (minFrameTime && *minFrameTime) props[(__bridge NSString *)*minFrameTime] = @(1.0 / 30.0);
-
-    TVPreviewView *view = _view;
-    _stream = create(_displayID, (size_t)(w * 2), (size_t)(h * 2), 0x42475241 /* 'BGRA' */,
-                     (__bridge CFDictionaryRef)props, dispatch_get_main_queue(),
-                     ^(int32_t status, uint64_t displayTime, void *frameSurface, const void *updateRef) {
-        if (status == 0 && frameSurface) view.layer.contents = (__bridge id)frameSurface;
-    });
-    if (!_stream || start(_stream) != kCGErrorSuccess) {
-        _stream = NULL;
-        return NO;
-    }
     [_window orderFrontRegardless];
 
     __weak NSWindow *window = _window;
@@ -280,18 +249,17 @@ typedef CGError (*TVStreamStopFn)(TVStreamRef stream);
     return YES;
 }
 
+- (void)showSurface:(IOSurfaceRef)surface {
+    if (_view && surface) _view.layer.contents = (__bridge id)surface;
+}
+
 - (void)show { [_window orderFrontRegardless]; }
 - (void)hide { [_window orderOut:nil]; }
 
 - (void)stop {
     [_timer invalidate];
     _timer = nil;
-    if (_stream) {
-        TVStreamStopFn stop = (TVStreamStopFn)dlsym(RTLD_DEFAULT, "CGDisplayStreamStop");
-        if (stop) stop(_stream);
-        CFRelease(_stream);
-        _stream = NULL;
-    }
+    _view.layer.contents = nil;
     [_window orderOut:nil];
     _window = nil;
 }

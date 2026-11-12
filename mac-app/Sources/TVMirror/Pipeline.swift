@@ -4,11 +4,18 @@ import CoreVideo
 import ScreenCaptureKit
 import VideoToolbox
 
+/// macOS hasn't let TellyBeam record the screen (Screen Recording permission).
+struct ScreenPermissionError: Error, CustomStringConvertible {
+    var description: String { "Screen Recording isn't allowed for TellyBeam." }
+}
+
 /// Records one screen with ScreenCaptureKit and keeps the latest picture.
 final class ScreenSource: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private let lock = NSLock()
     private var latest: CVPixelBuffer?
+    private var frames = 0
+    private var onFrameHandler: ((CVPixelBuffer) -> Void)?
     private let queue = DispatchQueue(label: "tvmirror.capture")
 
     var latestFrame: CVPixelBuffer? {
@@ -16,9 +23,45 @@ final class ScreenSource: NSObject, SCStreamOutput, SCStreamDelegate {
         return latest
     }
 
+    /// How many pictures macOS has delivered so far (0 = nothing is being recorded).
+    var frameCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return frames
+    }
+
+    /// Called on the capture queue with every new picture (used by the mini screen).
+    var onFrame: ((CVPixelBuffer) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return onFrameHandler }
+        set { lock.lock(); onFrameHandler = newValue; lock.unlock() }
+    }
+
+    /// Asks ScreenCaptureKit for the screens. Unlike CGPreflightScreenCaptureAccess (which
+    /// macOS only updates when the app restarts, and which goes wrong when an old copy of
+    /// the app is still listed in System Settings), this is what recording actually needs.
+    static func shareableContent() async throws -> SCShareableContent {
+        let content: SCShareableContent
+        do {
+            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        } catch {
+            Log.write("shareable content failed: \(error)")
+            if (error as? SCStreamError)?.code == .userDeclined
+                || (error as NSError).domain == SCStreamError.errorDomain {
+                throw ScreenPermissionError()
+            }
+            throw error
+        }
+        if content.displays.isEmpty { throw ScreenPermissionError() }   // what macOS gives when not allowed
+        return content
+    }
+
+    static func canRecord() async -> Bool {
+        do { _ = try await shareableContent(); return true } catch { return false }
+    }
+
     func start(displayID: CGDirectDisplayID, width: Int, height: Int, fps: Int) async throws {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        let content = try await Self.shareableContent()
         guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
+            Log.write("display \(displayID) not in \(content.displays.map { $0.displayID })")
             throw Discovery.TVError(description: "Couldn't find that screen to record.")
         }
         let filter = SCContentFilter(display: display, excludingWindows: [])
@@ -31,14 +74,21 @@ final class ScreenSource: NSObject, SCStreamOutput, SCStreamDelegate {
         config.queueDepth = 6
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
-        try await stream.startCapture()
+        do {
+            try await stream.startCapture()
+        } catch {
+            Log.write("start capture failed: \(error)")
+            if (error as? SCStreamError)?.code == .userDeclined { throw ScreenPermissionError() }
+            throw error
+        }
         self.stream = stream
+        Log.write("recording display \(displayID) at \(width)x\(height)")
     }
 
     func stop() async {
         try? await stream?.stopCapture()
         stream = nil
-        lock.lock(); latest = nil; lock.unlock()
+        lock.lock(); latest = nil; frames = 0; onFrameHandler = nil; lock.unlock()
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
@@ -49,7 +99,12 @@ final class ScreenSource: NSObject, SCStreamOutput, SCStreamDelegate {
               let raw = attachments.first?[.status] as? Int,
               SCFrameStatus(rawValue: raw) == .complete,
               let pixels = sampleBuffer.imageBuffer else { return }
-        lock.lock(); latest = pixels; lock.unlock()
+        lock.lock()
+        latest = pixels
+        frames += 1
+        let handler = onFrameHandler
+        lock.unlock()
+        handler?(pixels)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -171,6 +226,15 @@ final class MirrorSession {
 
     private let source = ScreenSource()
     private var encoder: H264Encoder?
+
+    /// Pictures recorded so far; stays 0 if macOS isn't really letting TellyBeam record.
+    var framesRecorded: Int { source.frameCount }
+
+    /// Every new picture, for the mini screen (called on the capture queue).
+    var onPreviewFrame: ((CVPixelBuffer) -> Void)? {
+        get { source.onFrame }
+        set { source.onFrame = newValue }
+    }
     private let muxer = TSMuxer()
     private let queue = DispatchQueue(label: "tvmirror.pipeline")
     private var timer: DispatchSourceTimer?

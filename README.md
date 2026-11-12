@@ -20,11 +20,14 @@ For Macs with Apple Silicon (M1 or newer) on macOS 13 or later.
 4. Pick your TV and click **Show my screen on the TV** or **Use the TV as an extra screen**
 
 First time only:
-- If it asks for Screen Recording, turn on TellyBeam in System Settings, then quit TellyBeam and open it again
+- If it asks for Screen Recording, turn on TellyBeam in System Settings, then click **Restart TellyBeam** in the TellyBeam window (just closing the window and opening it again isn't enough)
+- If it keeps asking even though TellyBeam is switched on (this happens after installing a newer download), click **Reset permission**, switch TellyBeam on once more, then **Restart TellyBeam**
 - If it asks about your local network, click Allow (it needs that to find the TV)
 - For extra screen, Apple asks how you want to use the new display. Pick **Extend**, not Mirror
 
 To move a window onto the TV, hover over its green button and choose **Move to TellyBeam Display**. There's a little live preview window (Show mini screen) so you can see what's on the TV without looking at it.
+
+TellyBeam only says "Showing" once the TV is actually downloading the picture. If something's wrong it tells you what, and it keeps a log at `~/Library/Logs/TVMirror.log`.
 
 The app is still new. If it gives you trouble, the [Terminal version](TERMINAL.md) is the one I've used the most and it works.
 
